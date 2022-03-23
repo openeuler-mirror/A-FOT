@@ -1,0 +1,330 @@
+#!/bin/bash
+current_path=$(cd "$(dirname "$0")";pwd)
+config_file=${current_path}/a-fot.ini
+
+# Profile名字
+profile_name="profile.data"
+# gcov名字
+gcov_name="profile.gcov"
+
+# 解析配置文件配置项
+function parse_config() {
+  if [[ ! -f ${config_file} ]]; then
+    echo "[ERROR] Could not load config file at: ${config_file}, please check!"
+    exit 1
+  fi
+  while read line; do
+    if [[ ! ${line} =~ "#" ]]; then
+      key=$(echo ${line} | awk -F "=" '{print $1}')
+      value=$(echo ${line} | awk -F "=" '{print $2}')
+      eval "${key}=${value}"
+    fi
+  done <${config_file}
+}
+
+# 解析输入的参数
+function parse_input_params() {
+  if [[ $# == 1 ]]; then
+    suggest_info
+    exit 1
+  fi
+  while [ $# -ge 2 ]; do
+    case $1 in
+    --opt_mode)
+      opt_mode=$2
+      shift 2
+      ;;
+    --perf_time)
+      perf_time=$2
+      shift 2
+      ;;
+    --app_name)
+      application_name=$2
+      shift 2
+      ;;
+    --bin_file)
+      bin_file=$2
+      shift 2
+      ;;
+    --build_script)
+      build_script=$2
+      shift 2
+      ;;
+    --work_path)
+      work_path=$2
+      shift 2
+      ;;
+    --run_script)
+      run_script=$2
+      shift 2
+      ;;
+    --max_waiting_time)
+      max_waiting_time=$2
+      shift 2
+      ;;
+    --gcc_path)
+      gcc_path=$2
+      shift 2
+      ;;
+    --config_file)
+      config_file=$2
+      shift 2
+      ;;
+    --check_success)
+      check_success=$2
+      shift 2
+      ;;
+    *)
+      suggest_info
+      exit 1
+      ;;
+    esac
+  done
+}
+
+function check_config_item() {
+  if [[ -z ${application_name} ]]; then
+    echo "[ERROR] The configuration item 'application_name' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${bin_file} ]]; then
+    echo "[ERROR] The configuration item 'bin_file' is missing, please check!"
+    exit 1
+  fi
+
+  if [[ -z ${work_path} ]]; then
+    echo "[ERROR] The configuration item 'work_path' is missing, please check!"
+    exit 1
+  fi
+    if [[ -z ${build_script} ]]; then
+    echo "[ERROR] The configuration item 'build_script' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${run_script} ]]; then
+    echo "[ERROR] The configuration item 'run_script' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${max_waiting_time} ]]; then
+    echo "[ERROR] The configuration item 'max_waiting_time' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${opt_mode} ]]; then
+    echo "[ERROR] The configuration item 'opt_mode' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${perf_time} ]]; then
+    echo "[ERROR] The configuration item 'perf_time' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${gcc_path} ]]; then
+    echo "[ERROR] The configuration item 'gcc_path' is missing, please check!"
+    exit 1
+  fi
+  if [[ -z ${check_success} ]]; then
+    echo "[ERROR] The configuration item 'check_success' is missing, please check!"
+    exit 1
+  fi
+}
+
+function suggest_info() {
+  echo """
+Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
+
+--config_file       Path of configuration file
+--opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT)
+--perf_time         Perf sampling duration (unit: seconds)
+--gcc_path          Compiler gcc path
+--app_name          Application process name
+--bin_file          Executable binary file path
+--build_script      Application build script path
+--work_path         Script working directory (used to compile the application and store the profile)
+--run_script        Script path for run application
+--max_waiting_time  Maximum binary startup time (unit: seconds)
+--check_success     Check optimization result
+"""
+}
+
+# 根据模式加载不同的优化脚本
+function load_script() {
+  case ${opt_mode} in
+  "AutoFDO")
+    source ${current_path}/auto_fdo.sh
+    ;;
+  "AutoPrefetch")
+    source ${current_path}/auto_prefetch.sh
+    ;;
+  "AutoBOLT")
+    source ${current_path}/auto_bolt.sh
+    ;;
+  *)
+    echo "[ERROR] Optimization mode ${opt_mode} is not supported, Check the configuration item: opt_mode"
+    exit 1
+    ;;
+  esac
+}
+
+# 公共依赖检查项
+function check_common_dependency() {
+  get_arch=`arch`
+  if [[ ${get_arch} =~ "x86_64" || ${get_arch} =~ "aarch64" ]];then
+    echo "[INFO] Current arch: ${get_arch}"
+  else
+    echo "[ERROR] Unsupport arch: ${get_arch}"
+    exit 1
+  fi
+  if ! type perf &>/dev/null; then
+    echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'"
+    exit 1
+  fi
+}
+
+# 使用原始编译选项进行编译
+function first_compilation() {
+  echo "[INFO] Start raw compilation"
+  is_file_exist ${build_script} "build_script"
+  /bin/bash ${build_script} >> ${log_file} 2>&1
+  is_success $?
+}
+
+# 创建wrapper之后的操作
+function post_create_wrapper() {
+  chmod 755 ${gcc_wrapper}/gcc
+  chmod 755 ${gcc_wrapper}/g++
+
+  export CC=${gcc_wrapper}/gcc
+  export CXX=${gcc_wrapper}/g++
+  export LD_LIBRARY_PATH=${gcc_path}/lib64:${LD_LIBRARY_PATH}
+
+  export PATH=${gcc_wrapper}:${PATH}
+}
+
+# 执行应用程序执行脚本
+function execute_run_script() {
+  echo "[INFO] Start to execute the benchmark"
+  process_id=$(pidof ${application_name})
+  if [[ -n ${process_id} ]]; then
+    echo "[ERROR] Application: ${application_name} process already exists. The benchmark will not be executed. Please check"
+    exit 1
+  fi
+  is_file_exist ${run_script} "run_script"
+  /bin/bash ${run_script}  >> ${log_file} 2>&1 &
+  is_success $?
+}
+
+# 探测应用进程是否存在
+function detect_process() {
+  echo "[INFO] Start to detect whether process ${application_name} is started"
+  detect_time=0
+  while [ -z $(pidof ${application_name}) ]; do
+    sleep 1
+    ((detect_time = ${detect_time} + 1))
+    echo "[INFO] Finding ${application_name}"
+    if [[ ${detect_time} -gt ${max_waiting_time} ]]; then
+      echo "[ERROR] Process ${application_name} is not found after ${max_waiting_time}. Please check"
+      exit 1
+    fi
+  done
+  echo "[INFO] Found Process ${application_name}: $(pidof ${application_name})"
+}
+
+# 使用新的编译选项编译，同时判断优化结果
+function second_compilation() {
+  echo "[INFO] Compile with new compilation options"
+  if [[ ${check_success} -eq 1 ]]; then
+    /bin/bash ${build_script} >> ${log_file} 2>&1 & build_id=$!
+    echo "[INFO] Found build id: ${build_id}"
+    add_opt=$(cat ${gcc_wrapper}/gcc | awk -F "=" '{print $1}')
+    build_status=`ps -p ${build_id} | grep -c ${build_id}`
+    opt_success=0
+    while [[ ${build_status} -ne 0 ]]; do
+      if [[ ${opt_success} -eq 0 ]]; then
+        if [[ $(ps aux | grep -c "${add_opt}") -gt 0 ]]; then
+          opt_success=1
+          break
+        fi
+      fi
+      build_status=`ps -p ${build_id} | grep -c ${build_id}`
+      sleep 1
+    done
+    wait
+  else
+    /bin/bash ${build_script} >> ${log_file} 2>&1
+  fi
+  is_success $?
+}
+
+# 判断上一步执行是否成功
+function is_success() {
+  pre_result=$1
+  if [[ ${pre_result} -eq 1 ]]; then
+    echo "[ERROR] Execution failed, please check the log: ${log_file}"
+    exit 1
+  fi
+}
+
+# 检查配置文件脚本是否存在
+function is_file_exist() {
+  file=$1
+  config_item=$2
+  if [[ ! -f ${file} ]]; then
+    if [[ -n ${config_item} ]]; then
+      echo "[ERROR] The file ${file} does not exist. Check the configuration item: ${config_item}"
+    else
+      echo "[ERROR] The file ${file} does not exist"
+    fi
+    exit 1
+  fi
+}
+
+#初始化profile文件夹和log文件
+function init_profile_and_log() {
+  # Profile和log所在路径
+  now_time=$(date '+%Y%m%d-%H%M%S')
+  profile_data_path=${work_path}/${now_time}
+  log_file=${work_path}/${now_time}/opt.log
+  if [[ ! -d ${profile_data_path} ]]; then
+    mkdir -p ${profile_data_path}
+  fi
+  echo "[INFO] Create profile dir: ${profile_data_path}"
+
+  touch ${log_file}
+  echo "[INFO] Init log file: ${log_file}"
+
+  # 创建Wrapper所在路径
+  gcc_wrapper="${work_path}/${now_time}/gcc_wrapper/"
+  mkdir -p ${gcc_wrapper}
+}
+
+#检测是否优化成功
+function is_opt_success() {
+  if [[ ${check_success} -eq 1 ]]; then
+    if [[ ${opt_success} -eq 0 ]]; then
+      echo "[WARNING] Optimization may fail or the build process is too short, please check!"
+    else
+      echo "[INFO] Optimization may success!"
+    fi
+  fi
+}
+
+#执行入口，部分函数为加载不同优化脚本中得到
+function main() {
+  parse_input_params "$@"
+  parse_config
+  parse_input_params "$@"
+  check_config_item
+  init_profile_and_log
+  load_script
+
+  check_dependency
+  create_wrapper
+  first_compilation
+  execute_run_script
+  detect_process
+  perf_record
+  create_new_wrapper
+
+  second_compilation
+  is_opt_success
+}
+
+main "$@"
