@@ -176,6 +176,10 @@ function check_common_dependency() {
     echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'"
     exit 1
   fi
+  is_file_exist ${bin_file}
+  is_file_exist ${build_script}
+  is_file_exist ${run_script}
+  is_file_exist "${gcc_path}/bin/gcc"
 }
 
 # 使用原始编译选项进行编译
@@ -200,10 +204,10 @@ function post_create_wrapper() {
 
 # 执行应用程序执行脚本
 function execute_run_script() {
-  echo "[INFO] Start to execute the benchmark"
+  echo "[INFO] Start to execute the run_script: ${run_script}"
   process_id=$(pidof ${application_name})
   if [[ -n ${process_id} ]]; then
-    echo "[ERROR] Application: ${application_name} process already exists. The benchmark will not be executed. Please check"
+    echo "[ERROR] Application: ${application_name} process already exists. The run_script will not be executed. Please check"
     exit 1
   fi
   is_file_exist ${run_script} "run_script"
@@ -227,29 +231,32 @@ function detect_process() {
   echo "[INFO] Found Process ${application_name}: $(pidof ${application_name})"
 }
 
-# 使用新的编译选项编译，同时判断优化结果
+# 使用新的编译选项编译，同时判断优化结果.
+# 需注意此检查依赖wrapper中编译器后添加第一个编译选项，
+# 因此需保证编译器后添加第一个编译选项为优化选项而非通用选项
 function second_compilation() {
-  echo "[INFO] Compile with new compilation options"
+  echo "[INFO] Try compiling with the new compilation options"
   if [[ ${check_success} -eq 1 ]]; then
     /bin/bash ${build_script} >> ${log_file} 2>&1 & build_id=$!
     echo "[INFO] Found build id: ${build_id}"
-    add_opt=$(cat ${gcc_wrapper}/gcc | awk -F "=" '{print $1}')
+    add_opt=$(cat ${gcc_wrapper}/gcc | awk -F " " '{print $2}')
     build_status=`ps -p ${build_id} | grep -c ${build_id}`
     opt_success=0
     while [[ ${build_status} -ne 0 ]]; do
       if [[ ${opt_success} -eq 0 ]]; then
-        if [[ $(ps aux | grep -c "${add_opt}") -gt 0 ]]; then
+        # 使用:1去除编译选项左边的'-'
+        if [[ $(ps aux | grep -c "${add_opt:1}") -gt 1 ]]; then
           opt_success=1
           break
         fi
       fi
       build_status=`ps -p ${build_id} | grep -c ${build_id}`
-      sleep 1
     done
     wait
   else
     /bin/bash ${build_script} >> ${log_file} 2>&1
   fi
+  echo "[INFO] Finish compiling with new compilation options"
   is_success $?
 }
 
@@ -300,6 +307,7 @@ function is_opt_success() {
   if [[ ${check_success} -eq 1 ]]; then
     if [[ ${opt_success} -eq 0 ]]; then
       echo "[WARNING] Optimization may fail or the build process is too short, please check!"
+      echo "[WARNING] Please try gcc/g++ at: ${gcc_wrapper} instead of the original compiler"
     else
       echo "[INFO] Optimization may success!"
     fi
