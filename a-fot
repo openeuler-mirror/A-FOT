@@ -176,7 +176,6 @@ function check_common_dependency() {
     echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'"
     exit 1
   fi
-  is_file_exist ${bin_file}
   is_file_exist ${build_script}
   is_file_exist ${run_script}
   is_file_exist "${gcc_path}/bin/gcc"
@@ -187,6 +186,7 @@ function first_compilation() {
   echo "[INFO] Start raw compilation"
   is_file_exist ${build_script} "build_script"
   /bin/bash ${build_script} >> ${log_file} 2>&1
+  is_file_exist ${bin_file}
   is_success $?
 }
 
