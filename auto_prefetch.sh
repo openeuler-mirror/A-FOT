@@ -12,8 +12,8 @@ function check_dependency() {
 # 创建原始wrapper
 function create_wrapper() {
   echo "[INFO] Start generating the original wrapper"
-  echo "${gcc_path}/bin/gcc -g \$@" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -g \$@" >${gcc_wrapper}/g++
+  echo "${gcc_path}/bin/gcc -g \"\$@\"" >${gcc_wrapper}/gcc
+  echo "${gcc_path}/bin/g++ -g \"\$@\"" >${gcc_wrapper}/g++
   post_create_wrapper
 }
 
@@ -43,6 +43,6 @@ function perf_record() {
 #生成新的wrapper
 function create_new_wrapper() {
   echo "[INFO] Start to generate a new wrapper"
-  echo "${gcc_path}/bin/gcc -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \$@" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \$@" >${gcc_wrapper}/g++
+  echo "${gcc_path}/bin/gcc -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${gcc_wrapper}/gcc
+  echo "${gcc_path}/bin/g++ -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${gcc_wrapper}/g++
 }
