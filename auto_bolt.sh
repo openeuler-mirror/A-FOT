@@ -12,8 +12,8 @@ function check_dependency() {
 # 创建原始wrapper
 function create_wrapper() {
   echo "[INFO] Start generating the original wrapper"
-  echo "${gcc_path}/bin/gcc -Wl,-q \$@" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -Wl,-q \$@" >${gcc_wrapper}/g++
+  echo "${gcc_path}/bin/gcc -Wl,-q \"\$@\"" >${gcc_wrapper}/gcc
+  echo "${gcc_path}/bin/g++ -Wl,-q \"\$@\"" >${gcc_wrapper}/g++
   post_create_wrapper
 }
 
@@ -31,6 +31,6 @@ function perf_record() {
 #生成新的wrapper
 function create_new_wrapper() {
   echo "[INFO] Start to generate a new wrapper"
-  echo "${gcc_path}/bin/gcc -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \$@" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \$@" >${gcc_wrapper}/g++
+  echo "${gcc_path}/bin/gcc -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${gcc_wrapper}/gcc
+  echo "${gcc_path}/bin/g++ -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${gcc_wrapper}/g++
 }
