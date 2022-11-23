@@ -308,10 +308,12 @@ function is_opt_success() {
     if [[ ${opt_success} -eq 0 ]]; then
       echo "[WARNING] Optimization may fail or the build process is too short, please check!"
       echo "[WARNING] Please try gcc/g++ at: ${gcc_wrapper} instead of the original compiler"
+      exit 1
     else
       echo "[INFO] Optimization may success!"
     fi
   fi
+  exit 0
 }
 
 #执行入口，部分函数为加载不同优化脚本中得到
@@ -333,6 +335,8 @@ function main() {
 
   second_compilation
   is_opt_success
+  exit "$?"
 }
 
 main "$@"
+exit "$?"
