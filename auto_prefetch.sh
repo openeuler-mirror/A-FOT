@@ -9,6 +9,23 @@ function check_dependency() {
   fi
 }
 
+# 根据模式选择Wrapper或者Bear模式构建
+function  prepare_env() {
+  case ${build_mode} in
+  "Wrapper")
+    create_wrapper
+    ;;
+  "Bear")
+    export COMPILATION_OPTIONS="-g"
+    export LINK_OPTIONS="-g"
+    ;;
+  *)
+    echo "[ERROR] Build mode ${build_mode} is not supported, the value is : Wrapper/Bear"
+    exit 1
+    ;;
+  esac
+}
+
 # 创建原始wrapper
 function create_wrapper() {
   echo "[INFO] Start generating the original wrapper"
@@ -38,6 +55,22 @@ function perf_record() {
   is_file_exist "${gcov_file_name}"
   is_file_exist "${profile_data_path}/${gcov_name}.cache-misses:u"
   pkill ${application_name}
+}
+
+# 根据模式选择Wrapper或者Bear模式构建
+function  prepare_new_env() {
+  case ${build_mode} in
+  "Wrapper")
+    create_new_wrapper
+    ;;
+  "Bear")
+    export COMPILATION_OPTIONS="-fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2"
+    ;;
+  *)
+    echo "[ERROR] Build mode ${build_mode} is not supported, the value is : Wrapper/Bear"
+    exit 1
+    ;;
+  esac
 }
 
 #生成新的wrapper

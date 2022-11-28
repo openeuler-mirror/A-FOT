@@ -74,6 +74,10 @@ function parse_input_params() {
       check_success=$2
       shift 2
       ;;
+    --build_mode)
+      build_mode=$2
+      shift 2
+      ;;
     *)
       suggest_info
       exit 1
@@ -124,6 +128,10 @@ function check_config_item() {
     echo "[ERROR] The configuration item 'check_success' is missing, please check!"
     exit 1
   fi
+  if [[ -z ${build_mode} ]]; then
+    echo "[ERROR] The configuration item 'build_mode' is missing, please check!"
+    exit 1
+  fi
 }
 
 function suggest_info() {
@@ -141,6 +149,7 @@ Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 --run_script        Script path for run application
 --max_waiting_time  Maximum binary startup time (unit: seconds)
 --check_success     Check optimization result
+--build_mode        Execute build scrip mode (Wrapper/Bear)
 """
 }
 
@@ -181,11 +190,27 @@ function check_common_dependency() {
   is_file_exist "${gcc_path}/bin/gcc"
 }
 
+# 拆分编译数据库
+function split_option() {
+  if [ "$bear_prefix" ];then
+        python3 $current_path/split_json.py -i $PWD/compile_commands.json
+        mv $PWD/compile_commands.json $PWD/compile_commands_$1.json
+        mv $PWD/compile_commands.fail.json $PWD/compile_commands.fail_$1.json
+  fi
+}
+
 # 使用原始编译选项进行编译
 function first_compilation() {
   echo "[INFO] Start raw compilation"
   is_file_exist ${build_script} "build_script"
-  /bin/bash ${build_script} >> ${log_file} 2>&1
+  if [[ $build_mode =~ "Bear" ]]; then
+      bear_prefix="bear -- "
+      echo "[INFO] Build in Bear mode"
+  else
+      echo "[INFO] Build in Wrapper mode"
+  fi
+  $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1
+  split_option first
   is_file_exist ${bin_file}
   is_success $?
 }
@@ -237,7 +262,7 @@ function detect_process() {
 function second_compilation() {
   echo "[INFO] Try compiling with the new compilation options"
   if [[ ${check_success} -eq 1 ]]; then
-    /bin/bash ${build_script} >> ${log_file} 2>&1 & build_id=$!
+    $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1 & build_id=$!
     echo "[INFO] Found build id: ${build_id}"
     add_opt=$(cat ${gcc_wrapper}/gcc | awk -F " " '{print $2}')
     build_status=`ps -p ${build_id} | grep -c ${build_id}`
@@ -254,9 +279,10 @@ function second_compilation() {
     done
     wait
   else
-    /bin/bash ${build_script} >> ${log_file} 2>&1
+    $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1
   fi
   echo "[INFO] Finish compiling with new compilation options"
+  split_option second
   is_success $?
 }
 
@@ -326,13 +352,13 @@ function main() {
   load_script
 
   check_dependency
-  create_wrapper
+  prepare_env
   first_compilation
   execute_run_script
   detect_process
   perf_record
-  create_new_wrapper
 
+  prepare_new_env
   second_compilation
   is_opt_success
   exit "$?"
