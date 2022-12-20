@@ -64,7 +64,7 @@ function  prepare_new_env() {
     create_new_wrapper
     ;;
   "Bear")
-    export COMPILATION_OPTIONS="-fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2"
+    export COMPILATION_OPTIONS="-fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses:u -fprefetch-loop-arrays=2"
     ;;
   *)
     echo "[ERROR] Build mode ${build_mode} is not supported, the value is : Wrapper/Bear"
