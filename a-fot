@@ -1,8 +1,8 @@
 #!/bin/bash
-afot_path=$(cd "$(dirname "$0")";pwd)
+afot_path=$(cd "$(dirname "$0")" && pwd)
 config_file=${afot_path}/a-fot.ini
 
-# Profile名字
+# profile名字
 profile_name="profile.data"
 # gcov名字
 gcov_name="profile.gcov"
@@ -20,7 +20,7 @@ function parse_config() {
       key=$(echo ${line} | awk -F "=" '{print $1}')
       value=$(echo ${line} | awk -F "=" '{print $2}')
       if [[ ${key} =~ "CONFIG_" ]]; then
-        kernel_configs+="${key}=${value}"
+        kernel_configs+=("${key}=${value}")
       else
         eval "${key}=${value}"
       fi
@@ -101,7 +101,7 @@ function parse_input_params() {
       shift 2
       ;;
     --CONFIG_*)
-      kernel_configs+="${1:2}=$2"
+      kernel_configs+=("${1:2}=$2")
       shift 2
       ;;
     --last_time)
@@ -147,52 +147,26 @@ function parse_input_params() {
   fi
 }
 
-function check_config_item() {
-  if [[ -z ${application_name} ]]; then
-    echo "[ERROR] The configuration item 'application_name' is missing, please check!"
+# 检查某个配置项是否存在
+function check_item() {
+  if [[ -z $1 ]]; then
+    echo "[ERROR] The configuration item '$2' is missing, please check!"
     exit 1
   fi
-  if [[ -z ${bin_file} ]]; then
-    echo "[ERROR] The configuration item 'bin_file' is missing, please check!"
-    exit 1
-  fi
+}
 
-  if [[ -z ${work_path} ]]; then
-    echo "[ERROR] The configuration item 'work_path' is missing, please check!"
-    exit 1
-  fi
-    if [[ -z ${build_script} ]]; then
-    echo "[ERROR] The configuration item 'build_script' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${run_script} ]]; then
-    echo "[ERROR] The configuration item 'run_script' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${max_waiting_time} ]]; then
-    echo "[ERROR] The configuration item 'max_waiting_time' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${opt_mode} ]]; then
-    echo "[ERROR] The configuration item 'opt_mode' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${perf_time} ]]; then
-    echo "[ERROR] The configuration item 'perf_time' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${gcc_path} ]]; then
-    echo "[ERROR] The configuration item 'gcc_path' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${check_success} ]]; then
-    echo "[ERROR] The configuration item 'check_success' is missing, please check!"
-    exit 1
-  fi
-  if [[ -z ${build_mode} ]]; then
-    echo "[ERROR] The configuration item 'build_mode' is missing, please check!"
-    exit 1
-  fi
+function check_config_items() {
+  check_item ${application_name} application_name
+  check_item ${bin_file} bin_file
+  check_item ${work_path} work_path
+  check_item ${build_script} build_script
+  check_item ${run_script} run_script
+  check_item ${max_waiting_time} max_waiting_time
+  check_item ${opt_mode} opt_mode
+  check_item ${perf_time} perf_time
+  check_item ${gcc_path} gcc_path
+  check_item ${check_success} check_success
+  check_item ${build_mode} build_mode
 }
 
 function suggest_info() {
@@ -246,7 +220,7 @@ function load_script() {
     source ${afot_path}/auto_bolt.sh
     ;;
   *)
-    echo "[ERROR] Optimization mode ${opt_mode} is not supported, Check the configuration item: opt_mode"
+    echo "[ERROR] Optimization mode ${opt_mode} is not supported, check the configuration item: opt_mode"
     exit 1
     ;;
   esac
@@ -254,15 +228,15 @@ function load_script() {
 
 # 公共依赖检查项
 function check_common_dependency() {
-  get_arch=`arch`
-  if [[ ${get_arch} =~ "x86_64" || ${get_arch} =~ "aarch64" ]];then
+  get_arch=$(arch)
+  if [[ ${get_arch} =~ "x86_64" || ${get_arch} =~ "aarch64" ]]; then
     echo "[INFO] Current arch: ${get_arch}"
   else
     echo "[ERROR] Unsupport arch: ${get_arch}"
     exit 1
   fi
   if ! type perf &>/dev/null; then
-    echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'"
+    echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'."
     exit 1
   fi
   is_file_exist ${build_script}
@@ -272,24 +246,24 @@ function check_common_dependency() {
 
 # 拆分编译数据库
 function split_option() {
-  if [ "$bear_prefix" ];then
-        python3 $afot_path/split_json.py -i $PWD/compile_commands.json
-        mv $PWD/compile_commands.json $PWD/compile_commands_$1.json
-        mv $PWD/compile_commands.fail.json $PWD/compile_commands.fail_$1.json
+  if [ "$bear_prefix" ]; then
+    python3 $afot_path/split_json.py -i $PWD/compile_commands.json
+    mv $PWD/compile_commands.json $PWD/compile_commands_$1.json
+    mv $PWD/compile_commands.fail.json $PWD/compile_commands.fail_$1.json
   fi
 }
 
 # 使用原始编译选项进行编译
 function first_compilation() {
-  echo "[INFO] Start raw compilation"
+  echo "[INFO] Start raw compilation."
   is_file_exist ${build_script} "build_script"
   if [[ $build_mode =~ "Bear" ]]; then
-      bear_prefix="bear -- "
-      echo "[INFO] Build in Bear mode"
+    bear_prefix="bear -- "
+    echo "[INFO] Build in Bear mode."
   else
-      echo "[INFO] Build in Wrapper mode"
+    echo "[INFO] Build in Wrapper mode."
   fi
-  $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1
+  $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1
   split_option first
   is_file_exist ${bin_file}
   is_success $?
@@ -312,24 +286,24 @@ function execute_run_script() {
   echo "[INFO] Start to execute the run_script: ${run_script}"
   process_id=$(pidof ${application_name})
   if [[ -n ${process_id} ]]; then
-    echo "[ERROR] Application: ${application_name} process already exists. The run_script will not be executed. Please check"
+    echo "[ERROR] Application: ${application_name} process already exists. The run_script will not be executed. Please check!"
     exit 1
   fi
   is_file_exist ${run_script} "run_script"
-  /bin/bash ${run_script}  >> ${log_file} 2>&1 &
+  /bin/bash ${run_script} >>${log_file} 2>&1 &
   is_success $?
 }
 
 # 探测应用进程是否存在
 function detect_process() {
-  echo "[INFO] Start to detect whether process ${application_name} is started"
+  echo "[INFO] Start to detect whether process ${application_name} is started."
   detect_time=0
   while [ -z $(pidof ${application_name}) ]; do
     sleep 1
     ((detect_time = ${detect_time} + 1))
-    echo "[INFO] Finding ${application_name}"
+    echo "[INFO] Finding ${application_name}."
     if [[ ${detect_time} -gt ${max_waiting_time} ]]; then
-      echo "[ERROR] Process ${application_name} is not found after ${max_waiting_time}. Please check"
+      echo "[ERROR] Process ${application_name} is not found after ${max_waiting_time}. Please check!"
       exit 1
     fi
   done
@@ -340,12 +314,12 @@ function detect_process() {
 # 需注意此检查依赖wrapper中编译器后添加第一个编译选项，
 # 因此需保证编译器后添加第一个编译选项为优化选项而非通用选项
 function second_compilation() {
-  echo "[INFO] Try compiling with the new compilation options"
+  echo "[INFO] Try compiling with the new compilation options."
   if [[ ${check_success} -eq 1 ]]; then
-    $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1 & build_id=$!
+    $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1 & build_id=$!
     echo "[INFO] Found build id: ${build_id}"
     add_opt=$(cat ${gcc_wrapper}/gcc | awk -F " " '{print $2}')
-    build_status=`ps -p ${build_id} | grep -c ${build_id}`
+    build_status=$(ps -p ${build_id} | grep -c ${build_id})
     opt_success=0
     while [[ ${build_status} -ne 0 ]]; do
       if [[ ${opt_success} -eq 0 ]]; then
@@ -355,13 +329,13 @@ function second_compilation() {
           break
         fi
       fi
-      build_status=`ps -p ${build_id} | grep -c ${build_id}`
+      build_status=$(ps -p ${build_id} | grep -c ${build_id})
     done
     wait
   else
-    $bear_prefix /bin/bash ${build_script} >> ${log_file} 2>&1
+    $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1
   fi
-  echo "[INFO] Finish compiling with new compilation options"
+  echo "[INFO] Finish compiling with new compilation options."
   split_option second
   is_success $?
 }
@@ -381,9 +355,9 @@ function is_file_exist() {
   config_item=$2
   if [[ ! -f ${file} ]]; then
     if [[ -n ${config_item} ]]; then
-      echo "[ERROR] The file ${file} does not exist. Check the configuration item: ${config_item}"
+      echo "[ERROR] The file ${file} does not exist! Check the configuration item: ${config_item}"
     else
-      echo "[ERROR] The file ${file} does not exist"
+      echo "[ERROR] The file ${file} does not exist!"
     fi
     exit 1
   fi
@@ -391,7 +365,7 @@ function is_file_exist() {
 
 #初始化profile文件夹和log文件
 function init_profile_and_log() {
-  # Profile和log所在路径
+  # profile和log所在路径
   now_time=$(date '+%Y%m%d-%H%M%S')
   profile_data_path=${work_path}/${now_time}
   log_file=${work_path}/${now_time}/opt.log
@@ -413,10 +387,10 @@ function is_opt_success() {
   if [[ ${check_success} -eq 1 ]]; then
     if [[ ${opt_success} -eq 0 ]]; then
       echo "[WARNING] Optimization may fail or the build process is too short, please check!"
-      echo "[WARNING] Please try gcc/g++ at: ${gcc_wrapper} instead of the original compiler"
+      echo "[WARNING] Please try gcc/g++ at: ${gcc_wrapper} instead of the original compiler."
       exit 1
     else
-      echo "[INFO] Optimization may success!"
+      echo "[INFO] Optimization success!"
     fi
   fi
   exit 0
@@ -426,7 +400,7 @@ function do_optimization() {
   if [[ ${opt_mode} == Auto_kernel_PGO ]]; then
     source ${afot_path}/auto_kernel_pgo.sh
   fi
-  check_config_item
+  check_config_items
   init_profile_and_log
   load_script
 
