@@ -191,10 +191,10 @@ function first_reboot() {
       echo -e "[INFO] Please run this command to continue after rebooting:\n${next_cmd}" | tee -a ${log_file}
     fi
   else
-    echo ${next_cmd} >>/etc/rc.d/rc.local
-    chmod +x /etc/rc.d/rc.local
     echo "[WARNING] System will be rebooted in 10 seconds!!!" | tee -a ${log_file}
     sleep 10
+    echo ${next_cmd} >>/etc/rc.d/rc.local
+    chmod +x /etc/rc.d/rc.local
     reboot
   fi
   exit 0
@@ -226,8 +226,11 @@ function process_profiles() {
 
   echo "[INFO] Start post-processing the profiles." | tee -a ${log_file}
   find ${temp_dir} -name '*.gcda' >list.txt
-  /usr/bin/g++ ${afot_path}/GcovSummaryAddTool.cpp -o calcsum
-  ./calcsum list.txt
+  calcsum=${afot_path}/calcsum
+  if [[ ! -f ${calcsum} ]]; then
+    /usr/bin/g++ ${afot_path}/GcovSummaryAddTool.cpp -o ${calcsum}
+  fi
+  ${calcsum} list.txt
   rm -f list.txt
 
   profile_dir=${time_dir}/gcovdata
@@ -266,13 +269,13 @@ function second_compilation() {
     for config in ${kernel_configs[@]}; do
       next_cmd+=" --${config}"
     done
+    echo "[INFO] Switch to normal kernel for faster compilation." | tee -a ${log_file}
+    echo "[WARNING] System will be rebooted in 10 seconds!!!" | tee -a ${log_file}
+    sleep 10
     touch ${time_dir}/.flag
     echo ${next_cmd} >>/etc/rc.d/rc.local
     chmod +x /etc/rc.d/rc.local
-    echo "[INFO] Switch to normal kernel for faster compilation." | tee -a ${log_file}
-    echo "[WARNING] System will be rebooted in 10 seconds!!!" | tee -a ${log_file}
     grub2-set-default 1
-    sleep 10
     reboot
     exit 0
   fi

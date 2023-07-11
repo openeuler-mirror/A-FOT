@@ -197,7 +197,7 @@ For kernel PGO mode:
 --work_path         Script working directory (used to store the profile and the log)
 --run_script        Script path for running application
 --gcc_path          Compiler gcc path
---CONFIG_...        Kernel building
+--CONFIG_...        Kernel building configuration
 --last_time         Last time directory before rebooting (used to put log infos together)
 -s                  Silent mode (reboot automatically after kernel installation)
 -n                  Do not compile kernel automatically
