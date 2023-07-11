@@ -171,6 +171,6 @@ int main(int argc, char** argv)
             return 1;
         }
     }
-    fprintf(stderr, "[.] File procesed: %d \n", (int) fileNames.size());
+    fprintf(stderr, "[.] File processed: %d \n", (int) fileNames.size());
     return 0;
 }
