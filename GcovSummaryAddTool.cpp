@@ -24,6 +24,17 @@ constexpr long long GCOV_TAG_COUNTER_AVERAGE = 0x01ab0000u;
 constexpr long long GCOV_TAG_COUNTER_IOR = 0x01ad0000u;
 constexpr long long GCOV_TAG_COUNTER_TP = 0x01af0000u; // time profiler
 
+class GcovToolException : public std::exception {
+public:
+    GcovToolException(const std::string& message) : message_(message) {}
+    const char* what() const noexcept override {
+        return message_.c_str();
+    }
+
+private:
+    std::string message_;
+};
+
 static int ReadFile(const string filename, vector<char>& out)
 {
     FILE* fp = fopen(filename.c_str(), "rb");
@@ -100,16 +111,14 @@ static int ProcessFile(const string fileName)
         switch (state) {
             case 1:
                 if (val != GCOV_DATA_MAGIC) {
-                    fprintf(stderr, "[!] GCOV_DATA_MAGIC mismatches: 0x%x\n", val);
-                    return 1;
+                    throw GcovToolException("GCOV_DATA_MAGIC mismatches");
                 }
                 i += 2;
                 state = 2;
                 break;
             case 2:
                 if (i == n - 1 && val) {
-                    fprintf(stderr, "[!] Single last tag: 0x%x\n", val);
-                    return 1;
+                    throw GcovToolException("Single last tag");
                 }
                 if (val == GCOV_TAG_FUNCTION) {
                     i += 1 + vData[i + 1];
@@ -150,27 +159,37 @@ static int ProcessFile(const string fileName)
         }
     }
     if (WriteFile(fileName, source, valMax)) {
-        return 1;
+        throw GcovToolException("Failed to write file");
     }
     return 0;
 }
 
-int main(int argc, char** argv)
-{
-    vector<char> fileNameList;
-    if (argc != 2 || ReadFile(argv[1], fileNameList)) {
-        fprintf(stderr, "USAGE:\n  %s <Input File List>\n", argv[0]);
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage:\n  %s <Input File List>\n", argv[0]);
         return 1;
     }
-    vector<string> fileNames;
-    SplitLines(fileNameList, fileNames);
-    for (size_t i = 0; i < fileNames.size(); ++i) {
-        string fileName = fileNames[i];
-        fprintf(stderr, "[.] Processing %s \n", fileName.c_str());
-        if (ProcessFile(fileName)) {
-            return 1;
+
+    try {
+        vector<char> fileNameList;
+        if (ReadFile(argv[1], fileNameList)) {
+            throw GcovToolException("Failed to read file list");
         }
+
+        vector<string> fileNames;
+        SplitLines(fileNameList, fileNames);
+
+        for (const auto& fileName : fileNames) {
+            fprintf(stderr, "[.] Processing %s\n", fileName.c_str());
+            if (ProcessFile(fileName)) {
+                throw GcovToolException("Failed to process file");
+            }
+        }
+
+        fprintf(stderr, "[.] Files processed: %zu\n", fileNames.size());
+        return 0;
+    } catch (const GcovToolException& ex) {
+        fprintf(stderr, "[!] Error: %s\n", ex.what());
+        return 1;
     }
-    fprintf(stderr, "[.] File processed: %d \n", (int) fileNames.size());
-    return 0;
 }
