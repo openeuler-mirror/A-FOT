@@ -29,7 +29,7 @@ function check_config_items() {
     exit 1
   fi
   check_item ${run_script} run_script
-  check_item ${gcc_path} gcc_path
+  check_item ${compiler_path} compiler_path
 
   if [[ -n ${disable_compilation} ]]; then
     check_item ${makefile} makefile
@@ -83,11 +83,11 @@ function check_dependency() {
     exit 1
   fi
   is_file_exist ${run_script} "run_script"
-  is_file_exist "${gcc_path}/bin/gcc" "gcc_path"
+  is_file_exist "${compiler_path}/bin/gcc" "compiler_path"
 
-  export CC=${gcc_path}/bin/gcc
-  export PATH=${gcc_path}/bin:${PATH}
-  export LD_LIBRARY_PATH=${gcc_path}/lib64:${LD_LIBRARY_PATH}
+  export CC=${compiler_path}/bin/${c_compiler}
+  export PATH=${compiler_path}/bin:${PATH}
+  export LD_LIBRARY_PATH=${compiler_path}/lib64:${LD_LIBRARY_PATH}
 
   if [[ ${pgo_phase} -eq 1 ]] && [[ ${pgo_mode} == "all" ]] && [[ -z ${disable_compilation} ]]; then
     if echo 'int main() { return 0; }' | gcc -x c - -o /dev/null -Werror -fkernel-pgo >/dev/null 2>&1; then
@@ -174,7 +174,7 @@ function first_compilation() {
 
 # 第一次重启操作
 function first_reboot() {
-  next_cmd="${afot_path}/a-fot --opt_mode Auto_kernel_PGO --pgo_phase 2 --kernel_src ${kernel_src} --kernel_name ${kernel_name} --work_path ${work_path} --run_script ${run_script} --gcc_path ${gcc_path} --last_time ${now_time} -s"
+  next_cmd="${afot_path}/a-fot --opt_mode Auto_kernel_PGO --pgo_phase 2 --kernel_src ${kernel_src} --kernel_name ${kernel_name} --work_path ${work_path} --run_script ${run_script} --compiler_path ${compiler_path} --last_time ${now_time} -s"
   for config in ${kernel_configs[@]}; do
     next_cmd+=" --${config}"
   done
@@ -265,7 +265,7 @@ function second_compilation() {
   if [[ -f ${time_dir}/.flag ]]; then
     rm -f ${time_dir}/.flag
   else
-    next_cmd="${afot_path}/a-fot --opt_mode Auto_kernel_PGO --pgo_phase 2 --kernel_src ${kernel_src} --kernel_name ${kernel_name} --work_path ${work_path} --run_script ${run_script} --gcc_path ${gcc_path} --last_time ${now_time} -s"
+    next_cmd="${afot_path}/a-fot --opt_mode Auto_kernel_PGO --pgo_phase 2 --kernel_src ${kernel_src} --kernel_name ${kernel_name} --work_path ${work_path} --run_script ${run_script} --compiler_path ${compiler_path} --last_time ${now_time} -s"
     for config in ${kernel_configs[@]}; do
       next_cmd+=" --${config}"
     done

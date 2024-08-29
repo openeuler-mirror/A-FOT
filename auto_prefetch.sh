@@ -29,13 +29,13 @@ function prepare_env() {
 # 创建原始wrapper
 function create_wrapper() {
   echo "[INFO] Start generating the original wrapper."
-  echo "${gcc_path}/bin/gcc -g \"\$@\"" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -g \"\$@\"" >${gcc_wrapper}/g++
+  echo "${compiler_path}/bin/${c_compiler} -g \"\$@\"" >${compiler_wrapper}/${c_compiler}
+  echo "${compiler_path}/bin/${cxx_compiler} -g \"\$@\"" >${compiler_wrapper}/${cxx_compiler}
   post_create_wrapper
 }
 
 # 执行perf采样，生成profile文件
-function perf_record() {
+function profiling () {
   echo "[INFO] Start perf record by ${opt_mode} and generate a profile file."
   process_id=$(pidof ${application_name})
   get_arch=$(arch)
@@ -76,6 +76,6 @@ function prepare_new_env() {
 #生成新的wrapper
 function create_new_wrapper() {
   echo "[INFO] Start to generate a new wrapper."
-  echo "${gcc_path}/bin/gcc -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${gcc_wrapper}/g++
+  echo "${compiler_path}/bin/${c_compiler} -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${compiler_wrapper}/${c_compiler}
+  echo "${compiler_path}/bin/${cxx_compiler} -fauto-profile=${gcov_file_name} -fcache-misses-profile=${profile_data_path}/${gcov_name}.cache-misses\:u -fprefetch-loop-arrays=2 \"\$@\"" >${compiler_wrapper}/${cxx_compiler}
 }
