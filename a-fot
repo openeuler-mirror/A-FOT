@@ -64,10 +64,14 @@ function parse_input_params() {
       max_waiting_time=$2
       shift 2
       ;;
-    --gcc_path)
-      gcc_path=$2
+    --compiler)
+      compiler=$2
       shift 2
       ;;
+    --compiler_path)
+      compiler_path=$2
+      shift 2
+      ;;  
     --config_file)
       config_file=$2
       shift 2
@@ -164,7 +168,8 @@ function check_config_items() {
   check_item ${max_waiting_time} max_waiting_time
   check_item ${opt_mode} opt_mode
   check_item ${perf_time} perf_time
-  check_item ${gcc_path} gcc_path
+  check_item ${compiler} compiler
+  check_item ${compiler_path} compiler_path
   check_item ${check_success} check_success
   check_item ${build_mode} build_mode
 }
@@ -175,9 +180,10 @@ Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 
 For perf mode:
 --config_file       Path of configuration file
---opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT)
+--opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT/AutoPGO)
 --perf_time         Perf sampling duration (unit: seconds)
---gcc_path          Compiler gcc path
+--compiler          Compiler (gcc or llvm for now)
+--compiler_path     Compiler path
 --app_name          Application process name
 --bin_file          Executable binary file path
 --build_script      Application build script path
@@ -196,7 +202,7 @@ For kernel PGO mode:
 --kernel_name       Kernel local version name (will be appended with "-pgoing" or "-pgoed")
 --work_path         Script working directory (used to store the profile and the log)
 --run_script        Script path for running application
---gcc_path          Compiler gcc path
+--compiler_path     Compiler gcc path
 --CONFIG_...        Kernel building configuration
 --last_time         Last time directory before rebooting (used to put log infos together)
 -s                  Silent mode (reboot automatically after kernel installation)
@@ -218,6 +224,9 @@ function load_script() {
     ;;
   "AutoBOLT")
     source ${afot_path}/auto_bolt.sh
+    ;;
+  "AutoPGO")
+    source ${afot_path}/auto_pgo.sh
     ;;
   *)
     echo "[ERROR] Optimization mode ${opt_mode} is not supported, check the configuration item: opt_mode"
@@ -241,7 +250,18 @@ function check_common_dependency() {
   fi
   is_file_exist ${build_script}
   is_file_exist ${run_script}
-  is_file_exist "${gcc_path}/bin/gcc"
+  case ${compiler} in 
+  "gcc") 
+    is_file_exist "${compiler_path}/bin/gcc"
+    ;;
+  "llvm") 
+    is_file_exist "${compiler_path}/bin/clang" 
+    ;;
+  *)
+    echo "[ERROR] compiler ${compiler} is not supported, check the configuration item: compiler"
+    exit 1
+    ;;
+  esac
 }
 
 # 拆分编译数据库
@@ -271,14 +291,18 @@ function first_compilation() {
 
 # 创建wrapper之后的操作
 function post_create_wrapper() {
-  chmod 755 ${gcc_wrapper}/gcc
-  chmod 755 ${gcc_wrapper}/g++
+  chmod 755 ${compiler_wrapper}/${c_compiler}
+  chmod 755 ${compiler_wrapper}/${cxx_compiler}
 
-  export CC=${gcc_wrapper}/gcc
-  export CXX=${gcc_wrapper}/g++
-  export LD_LIBRARY_PATH=${gcc_path}/lib64:${LD_LIBRARY_PATH}
+  export CC=${compiler_wrapper}/${c_compiler}
+  export CXX=${compiler_wrapper}/${cxx_compiler}
+  if [ "$compiler" = "gcc" ]; then
+    export LD_LIBRARY_PATH=${compiler_path}/lib64:${LD_LIBRARY_PATH}
+  else
+    export LD_LIBRARY_PATH=${compiler_path}/lib:${LD_LIBRARY_PATH}
+  fi
 
-  export PATH=${gcc_wrapper}:${PATH}
+  export PATH=${compiler_wrapper}:${PATH}
 }
 
 # 执行应用程序执行脚本
@@ -291,6 +315,7 @@ function execute_run_script() {
   fi
   is_file_exist ${run_script} "run_script"
   /bin/bash ${run_script} >>${log_file} 2>&1 &
+  application_pid=$!
   is_success $?
 }
 
@@ -318,7 +343,7 @@ function second_compilation() {
   if [[ ${check_success} -eq 1 ]]; then
     $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1 & build_id=$!
     echo "[INFO] Found build id: ${build_id}"
-    add_opt=$(cat ${gcc_wrapper}/gcc | awk -F " " '{print $2}')
+    add_opt=$(cat ${compiler_wrapper}/${c_compiler} | awk -F " " '{print $2}')
     build_status=$(ps -p ${build_id} | grep -c ${build_id})
     opt_success=0
     while [[ ${build_status} -ne 0 ]]; do
@@ -336,6 +361,7 @@ function second_compilation() {
     $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1
   fi
   echo "[INFO] Finish compiling with new compilation options."
+  is_file_exist ${bin_file}
   split_option second
   is_success $?
 }
@@ -377,9 +403,18 @@ function init_profile_and_log() {
   touch ${log_file}
   echo "[INFO] Init log file: ${log_file}"
 
+  # 设置c和c++编译器
+  if [ "$compiler" = "gcc" ]; then
+    c_compiler="gcc"
+    cxx_compiler="g++"
+  else
+    c_compiler="clang"
+    cxx_compiler="clang++"
+  fi  
+
   # 创建Wrapper所在路径
-  gcc_wrapper="${work_path}/${now_time}/gcc_wrapper/"
-  mkdir -p ${gcc_wrapper}
+  compiler_wrapper="${work_path}/${now_time}/compiler_wrapper/"
+  mkdir -p ${compiler_wrapper}
 }
 
 #检测是否优化成功
@@ -387,7 +422,7 @@ function is_opt_success() {
   if [[ ${check_success} -eq 1 ]]; then
     if [[ ${opt_success} -eq 0 ]]; then
       echo "[WARNING] Optimization may fail or the build process is too short, please check!"
-      echo "[WARNING] Please try gcc/g++ at: ${gcc_wrapper} instead of the original compiler."
+      echo "[WARNING] Please try gcc/g++ or clang/clang++ at: ${compiler_wrapper} instead of the original compiler."
       exit 1
     else
       echo "[INFO] Optimization success!"
@@ -409,7 +444,7 @@ function do_optimization() {
   first_compilation
   execute_run_script
   detect_process
-  perf_record
+  profiling 
 
   prepare_new_env
   second_compilation

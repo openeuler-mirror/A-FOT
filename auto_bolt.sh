@@ -29,13 +29,13 @@ function prepare_env() {
 # 创建原始wrapper
 function create_wrapper() {
   echo "[INFO] Start generating the original wrapper."
-  echo "${gcc_path}/bin/gcc -Wl,-q \"\$@\"" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -Wl,-q \"\$@\"" >${gcc_wrapper}/g++
+  echo "${compiler_path}/bin/${c_compiler} -Wl,-q \"\$@\"" >${compiler_wrapper}/${c_compiler}
+  echo "${compiler_path}/bin/${cxx_compiler} -Wl,-q \"\$@\"" >${compiler_wrapper}/${cxx_compiler}
   post_create_wrapper
 }
 
 # 执行perf采样，生成profile文件
-function perf_record() {
+function profiling () {
   echo "[INFO] Start perf record by ${opt_mode} and generate a profile file."
   process_id=$(pidof ${application_name})
   perf record -e cycles:u -o ${profile_data_path}/${profile_name} -p ${process_id} -- sleep ${perf_time} >>${log_file} 2>&1
@@ -65,6 +65,6 @@ function prepare_new_env() {
 #生成新的wrapper
 function create_new_wrapper() {
   echo "[INFO] Start to generate a new wrapper."
-  echo "${gcc_path}/bin/gcc -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${gcc_wrapper}/gcc
-  echo "${gcc_path}/bin/g++ -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${gcc_wrapper}/g++
+  echo "${compiler_path}/bin/${c_compiler} -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${compiler_wrapper}/${c_compiler}
+  echo "${compiler_path}/bin/${cxx_compiler} -fbolt-use=${profile_data_path}/${gcov_name} -fbolt-target=${bin_file} -Wl,-q \"\$@\"" >${compiler_wrapper}/${cxx_compiler}
 }
