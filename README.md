@@ -6,7 +6,7 @@ A-FOT(automatic feedback-directed optimization tool)是一款用于提升编译�
 
 #### 环境依赖
 
-1.  编译器： openEuler GCC 10.3.1
+1.  编译器： GCC for openEuler 12.3.1
 2.  架构： x86_64 aarch64
 
 #### 安装教程
@@ -28,3 +28,4 @@ A-FOT(automatic feedback-directed optimization tool)是一款用于提升编译�
 1. 用户需要自行完成应用的构建脚本（build_script）和执行脚本（run_script）。本工具会使用构建脚本完成应用的构建，使用执行脚本启动被优化的应用
 2. 本工具目前仅支持单实例应用优化，即应用在执行时只有一个进程
 3. 用户需保证执行脚本启动的应用程序测试用例与实际生产环境行为相同，否则可能会导致负优化
+4. 使用A-FOT工具需要GCC的LLVM-BOLT for openEuler-12.3.0-24.12或更高版本，该版本比开源的LLVM-BOLT17.0.6新增了一些选项
