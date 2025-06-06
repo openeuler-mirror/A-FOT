@@ -228,6 +228,9 @@ function load_script() {
   "AutoPGO")
     source ${afot_path}/auto_pgo.sh
     ;;
+  "AutoCFGO")
+    source ${afot_path}/auto_cfgo.sh
+    ;;
   *)
     echo "[ERROR] Optimization mode ${opt_mode} is not supported, check the configuration item: opt_mode"
     exit 1
@@ -322,17 +325,62 @@ function execute_run_script() {
 # 探测应用进程是否存在
 function detect_process() {
   echo "[INFO] Start to detect whether process ${application_name} is started."
-  detect_time=0
-  while [ -z $(pidof ${application_name}) ]; do
+  local detect_time=0
+  local pids=()
+
+  # 进程启动检测
+  while true; do
+    # 使用pgrep获取所有同名进程ID
+    pids=($(pgrep -x "${application_name}" || true))
+    
+    if [ ${#pids[@]} -gt 0 ]; then
+      echo "[INFO] process ${application_name} found: ${pids[*]}"
+      break
+    fi
+    
     sleep 1
-    ((detect_time = ${detect_time} + 1))
-    echo "[INFO] Finding ${application_name}."
-    if [[ ${detect_time} -gt ${max_waiting_time} ]]; then
-      echo "[ERROR] Process ${application_name} is not found after ${max_waiting_time}. Please check!"
+    ((detect_time++))
+    
+    if [ ${detect_time} -gt ${max_waiting_time} ]; then
+      echo "[ERROR] can not find process ${application_name} in ${max_waiting_time}s"
       exit 1
     fi
   done
-  echo "[INFO] Found Process ${application_name}: $(pidof ${application_name})"
+
+  # 等待所有进程终止
+  echo "[INFO] waiting all ${application_name} finish"
+  detect_time=0
+  
+  while [ ${#pids[@]} -gt 0 ]; do
+    # 检查每个进程是否仍然存在
+    local remaining_pids=()
+    for pid in "${pids[@]}"; do
+      if ps -p "${pid}" > /dev/null; then
+        remaining_pids+=("${pid}")
+      fi
+    done
+    
+    pids=("${remaining_pids[@]}")
+    
+    if [ ${#pids[@]} -eq 0 ]; then
+      break
+    fi
+    
+    sleep 1
+    ((detect_time++))
+    
+    # 每分钟打印一次状态
+    if [ $((detect_time % 60)) -eq 0 ]; then
+      echo "[INFO] There are still ${#pids[@]} ${application_name} processes running: ${pids[*]}"
+    fi
+    
+    if [ ${detect_time} -gt ${max_waiting_time} ]; then
+      echo "[ERROR] Process ${application_name} did not fully terminate within ${max_waiting_time} seconds"
+      exit 1
+    fi
+  done
+  
+  echo "[INFO] All ${application_name} process has finish"
 }
 
 # 使用新的编译选项编译，同时判断优化结果.
@@ -440,14 +488,42 @@ function do_optimization() {
   load_script
 
   check_dependency
-  prepare_env
-  first_compilation
-  execute_run_script
-  detect_process
-  profiling 
 
-  prepare_new_env
-  second_compilation
+  # CFGO流程
+  if [[ ${opt_mode} =~ "AutoCFGO" ]]; then
+    # 执行CFGO-PGO插桩
+    prepare_env
+    first_compilation
+    execute_run_script
+    detect_process
+    profiling
+
+    # 执行CFGO-CSPGO插桩
+    prepare_new_env
+    second_compilation
+    execute_run_script
+    detect_process
+    profiling
+
+    # 执行CFGO-BOLT
+    prepare_bolt_env
+    second_compilation
+    do_bolt_instrument
+    execute_run_script
+    detect_process
+    profiling
+    do_bolt_opt
+  else
+    # 其他模式原有流程
+    prepare_env
+    first_compilation
+    execute_run_script
+    detect_process
+    profiling
+    prepare_new_env
+    second_compilation
+  fi
+  
   is_opt_success
 }
 
