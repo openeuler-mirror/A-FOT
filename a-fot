@@ -180,7 +180,7 @@ Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 
 For perf mode:
 --config_file       Path of configuration file
---opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT/AutoPGO)
+--opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT/AutoPGO/AutoCFGO)
 --perf_time         Perf sampling duration (unit: seconds)
 --compiler          Compiler (gcc or llvm for now)
 --compiler_path     Compiler path
@@ -286,7 +286,7 @@ function first_compilation() {
   else
     echo "[INFO] Build in Wrapper mode."
   fi
-  $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1
+  $bear_prefix -x /bin/bash ${build_script} >>${log_file} 2>&1
   split_option first
   is_file_exist ${bin_file}
   is_success $?
@@ -317,8 +317,8 @@ function execute_run_script() {
     exit 1
   fi
   is_file_exist ${run_script} "run_script"
-  /bin/bash ${run_script} >>${log_file} 2>&1 &
-  application_pid=$!
+  /bin/bash -x ${run_script} >>${log_file} 2>&1 &
+  run_script_pid=$!
   is_success $?
 }
 
@@ -389,7 +389,7 @@ function detect_process() {
 function second_compilation() {
   echo "[INFO] Try compiling with the new compilation options."
   if [[ ${check_success} -eq 1 ]]; then
-    $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1 & build_id=$!
+    $bear_prefix /bin/bash -x ${build_script} >>${log_file} 2>&1 & build_id=$!
     echo "[INFO] Found build id: ${build_id}"
     add_opt=$(cat ${compiler_wrapper}/${c_compiler} | awk -F " " '{print $2}')
     build_status=$(ps -p ${build_id} | grep -c ${build_id})
@@ -406,7 +406,7 @@ function second_compilation() {
     done
     wait
   else
-    $bear_prefix /bin/bash ${build_script} >>${log_file} 2>&1
+    $bear_prefix /bin/bash -x ${build_script} >>${log_file} 2>&1
   fi
   echo "[INFO] Finish compiling with new compilation options."
   is_file_exist ${bin_file}
@@ -455,9 +455,11 @@ function init_profile_and_log() {
   if [ "$compiler" = "gcc" ]; then
     c_compiler="gcc"
     cxx_compiler="g++"
+    export LD_LIBRARY_PATH=${compiler_path}/lib64:${LD_LIBRARY_PATH}
   else
     c_compiler="clang"
     cxx_compiler="clang++"
+    export LD_LIBRARY_PATH=${compiler_path}/lib:${LD_LIBRARY_PATH}
   fi  
 
   # 创建Wrapper所在路径
