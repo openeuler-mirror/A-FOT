@@ -180,7 +180,7 @@ Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 
 For perf mode:
 --config_file       Path of configuration file
---opt_mode          Optimization modes (AutoFDO/AutoPrefetch/AutoBOLT/AutoPGO/AutoCFGO)
+--opt_mode          Optimization modes (AutoFDO/AutoBOLT/AutoPGO/AutoCFGO)
 --perf_time         Perf sampling duration (unit: seconds)
 --compiler          Compiler (gcc or llvm for now)
 --compiler_path     Compiler path
@@ -218,9 +218,6 @@ function load_script() {
   case ${opt_mode} in
   "AutoFDO")
     source ${afot_path}/auto_fdo.sh
-    ;;
-  "AutoPrefetch")
-    source ${afot_path}/auto_prefetch.sh
     ;;
   "AutoBOLT")
     source ${afot_path}/auto_bolt.sh
@@ -349,7 +346,6 @@ function detect_process() {
 
   # 只有AutoCFGO模式需要等待所有程序执行完毕
   if [[ ${opt_mode} != "AutoCFGO" ]]; then
-    # 非AutoCFGO模式需要等待所有进程终止
     return
   fi
 
