@@ -286,7 +286,7 @@ function first_compilation() {
   else
     echo "[INFO] Build in Wrapper mode."
   fi
-  $bear_prefix -x /bin/bash ${build_script} >>${log_file} 2>&1
+  $bear_prefix bash -x ${build_script} >>${log_file} 2>&1
   split_option first
   is_file_exist ${bin_file}
   is_success $?
@@ -346,6 +346,12 @@ function detect_process() {
       exit 1
     fi
   done
+
+  # 只有AutoCFGO模式需要等待所有程序执行完毕
+  if [[ ${opt_mode} != "AutoCFGO" ]]; then
+    # 非AutoCFGO模式需要等待所有进程终止
+    return
+  fi
 
   # 等待所有进程终止
   echo "[INFO] waiting all ${application_name} finish"

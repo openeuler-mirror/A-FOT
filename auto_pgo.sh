@@ -65,7 +65,6 @@ function process_profile() {
   if [ "$compiler" = "llvm" ]; then
     llvm-profdata merge ${profile_data_path}/**/*.profraw -output=${profile_data_path}/${profdata_name}  >>${log_file} 2>&1
     is_file_exist "${profile_data_path}/${profdata_name}"
-  else
     count=0
     for dir in "${profile_data_path}"/pgo-*; do
       if [ -d "$dir" ]; then
