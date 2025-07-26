@@ -65,21 +65,6 @@ function process_profile() {
   if [ "$compiler" = "llvm" ]; then
     llvm-profdata merge ${profile_data_path}/**/*.profraw -output=${profile_data_path}/${profdata_name}  >>${log_file} 2>&1
     is_file_exist "${profile_data_path}/${profdata_name}"
-  else
-    count=0
-    for dir in "${profile_data_path}"/pgo-*; do
-      if [ -d "$dir" ]; then
-        if [ $count -eq 0 ]; then
-          pgo_dir=$(ls -d ${profile_data_path}/pgo-*/ | head -n 1)
-          file_name=$(basename "${pgo_dir}"/*)
-          cp "${pgo_dir}/${file_name}" "${profile_data_path}/${file_name}"
-        else
-          gcov-tool merge -o "${profile_data_path}" "${dir}" "${profile_data_path}"
-        fi
-        count=$((count + 1))
-      fi
-    done
-    is_file_exist "${profile_data_path}/${file_name}"
   fi
 }
 
