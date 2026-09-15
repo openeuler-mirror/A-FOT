@@ -998,6 +998,44 @@ function validate_cfgo_config() {
     if [[ "$(cfgo_substage_index "${start_substage}")" -lt 0 ]]; then
       fail_stage "validate_config" 1 "Invalid start_substage='${start_substage}' for AutoCFGO." "Use one of: ${cfgo_substages[*]}."
     fi
+    # 从非初始子阶段恢复时，校验所需 profile/二进制是否存在
+    local resume_index
+    resume_index=$(cfgo_substage_index "${start_substage}")
+    if [[ "$resume_index" -gt 0 ]]; then
+      if [[ -z "${last_time:-}" ]]; then
+        fail_stage "validate_config" 1 \
+          "start_substage=${start_substage} 需要从已有运行目录恢复，但未指定 --last_time。" \
+          "请通过 --last_time 指定上一次运行的目录时间戳。"
+      fi
+      local check_profiles_dir="${work_path}/${last_time}/profiles"
+      # 从 05-build-cfgo-cspgo 或更晚恢复时，需要 cfgo-pgo profile
+      if [[ "$resume_index" -ge 4 ]]; then
+        local pgo_dir="${check_profiles_dir}/cfgo-pgo"
+        if [[ ! -d "$pgo_dir" ]] || [[ -z "$(ls -A "$pgo_dir" 2>/dev/null)" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 cfgo-pgo profile，但 ${pgo_dir} 为空或不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
+      # 从 07-bolt-instrument 或更晚恢复时，需要 cfgo-cspgo profile
+      if [[ "$resume_index" -ge 6 ]]; then
+        local cspgo_dir="${check_profiles_dir}/cfgo-cspgo"
+        if [[ ! -d "$cspgo_dir" ]] || [[ -z "$(ls -A "$cspgo_dir" 2>/dev/null)" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 cfgo-cspgo profile，但 ${cspgo_dir} 为空或不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
+      # 从 09-bolt-optimize 恢复时，需要 bolt profile
+      if [[ "$resume_index" -ge 8 ]]; then
+        local bolt_dir="${check_profiles_dir}/cfgo-bolt"
+        if [[ ! -d "$bolt_dir" ]] || [[ ! -f "${bolt_dir}/bolt.inst.fdata" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 BOLT profile，但 ${bolt_dir}/bolt.inst.fdata 不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
+    fi
   fi
 }
 
@@ -1030,7 +1068,7 @@ Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 For perf mode:
 --config_file       Path of configuration file
 --opt_mode          Optimization modes (AutoFDO/AutoBOLT/AutoPGO/AutoCFGO)
---perf_time         Perf sampling duration (unit: seconds)
+--perf_time         Perf sampling max duration in seconds (0 = unlimited, until process exits)
 --compiler          Compiler (gcc or llvm for now)
 --compiler_path     Compiler path
 --app_name          Application process name
@@ -1266,6 +1304,10 @@ function first_compilation() {
   stage_log=$(get_active_log_file)
   log_status "开始原始构建 | 输入脚本=${build_script} | 日志=${stage_log}"
   is_file_exist "${build_script}" "build_script" "file"
+
+  # 原始构建阶段刻意使用 build_script 自带的编译器（通常为系统 PATH 中的版本），
+  # 不注入 wrapper、不设置 CC/CXX，以此作为性能对比的基线。
+  # 后续 PGO/CSPGO/BOLT 优化阶段会通过 wrapper 切换到 ${compiler_path} 指定的编译器。
   if [[ "${build_mode}" =~ "Bear" ]]; then
     bear_prefix="bear -- "
     log_info "当前使用 Bear 构建模式。"
@@ -1290,12 +1332,7 @@ function post_create_wrapper() {
 
   export CC="${compiler_wrapper}/${c_compiler}"
   export CXX="${compiler_wrapper}/${cxx_compiler}"
-  if [[ "$compiler" == "gcc" ]]; then
-    export LD_LIBRARY_PATH="${compiler_path}/lib64:${LD_LIBRARY_PATH}"
-  else
-    export LD_LIBRARY_PATH="${compiler_path}/lib:${LD_LIBRARY_PATH}"
-  fi
-
+  # LD_LIBRARY_PATH 已在 init_profile_and_log() 中设置，此处不再重复叠加
   export PATH="${compiler_wrapper}:${PATH}"
 }
 
@@ -1314,7 +1351,9 @@ function execute_run_script() {
   /bin/bash -x "${run_script}" >>"${stage_log}" 2>&1 &
   run_script_pid=$!
   log_info "运行脚本后台PID：${run_script_pid}"
-  is_success "$?" "启动运行脚本 '${run_script}' 失败。" "请检查脚本路径、权限和脚本内容。"
+  if [[ -z "${run_script_pid}" ]]; then
+    fail_stage "optimization_flow" 1 "启动运行脚本失败，未获取到 PID。" "请检查脚本路径、权限和脚本内容。"
+  fi
 }
 
 # 探测应用进程是否存在
@@ -1456,7 +1495,11 @@ function is_file_exist() {
 
 #初始化profile文件夹和log文件
 function init_profile_and_log() {
-  now_time=$(date '+%Y%m%d-%H%M%S')
+  if [[ -n "${last_time:-}" ]]; then
+    now_time="${last_time}"
+  else
+    now_time=$(date '+%Y%m%d-%H%M%S')
+  fi
   profile_data_path="${work_path}/${now_time}"
   log_file="${profile_data_path}/opt.log"
   summary_file="${profile_data_path}/run-summary.txt"
@@ -1599,6 +1642,17 @@ function do_optimization() {
   mark_stage_success "optimization_flow"
   is_opt_success
 }
+
+# Ctrl-C 或 kill 时清理后台进程并写入最终 summary
+function cleanup_on_interrupt() {
+  log_warn "收到中断信号，正在清理..."
+  write_summary
+  if [[ -n "${run_script_pid:-}" ]] && kill -0 "${run_script_pid}" 2>/dev/null; then
+    kill "${run_script_pid}" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap cleanup_on_interrupt INT TERM
 
 #执行入口，部分函数为加载不同优化脚本中得到
 function main() {

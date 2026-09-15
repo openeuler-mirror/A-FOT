@@ -38,7 +38,9 @@ function create_wrapper() {
 function profiling () {
   echo "[INFO] Start perf record by ${opt_mode} and generate a profile file."
   process_id=$(pidof ${application_name})
-  perf record -e cycles:u -o ${profile_data_path}/${profile_name} -p ${process_id} -- sleep ${perf_time} >>${log_file} 2>&1
+  local perf_sleep="${perf_time:-0}"
+  [[ "$perf_sleep" == "0" ]] && perf_sleep="infinity"
+  perf record -e cycles:u -o ${profile_data_path}/${profile_name} -p ${process_id} -- sleep "${perf_sleep}" >>${log_file} 2>&1
   is_file_exist "${profile_data_path}/${profile_name}"
   perf2bolt -p=${profile_data_path}/${profile_name} ${bin_file} -o ${profile_data_path}/${gcov_name} -nl >>${log_file} 2>&1
   is_file_exist "${profile_data_path}/${gcov_name}"

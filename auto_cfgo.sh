@@ -107,16 +107,6 @@ function write_single_wrapper() {
   local flags=("$@")
   local trace_flags
   trace_flags=$(printf '%q ' "${flags[@]}")
-  local exclude_patterns=()
-
-  case "$stage_name" in
-  "05-build-cfgo-cspgo"|"07-bolt-instrument"|"09-bolt-optimize")
-    exclude_patterns=(
-      "/sql/spatial.cc"
-    )
-    ;;
-  esac
-
   {
     printf '#!/bin/bash\n'
     printf '# 阶段：%s\n' "$stage_name"
@@ -134,44 +124,8 @@ function write_single_wrapper() {
       printf ' %q' "$flag"
     done
     printf ' )\n'
-    printf 'exclude_patterns=('
-    local pattern
-    for pattern in "${exclude_patterns[@]}"; do
-      printf ' %q' "$pattern"
-    done
-    printf ' )\n'
     cat <<'EOF'
 argv_quoted=$(printf '%q ' "$@")
-should_skip_inject=0
-matched_arg=
-
-if [[ ${#exclude_patterns[@]} -gt 0 ]]; then
-  for arg in "$@"; do
-    case "$arg" in
-    *.c|*.cc|*.cpp|*.cxx|*.C)
-      for pattern in "${exclude_patterns[@]}"; do
-        if [[ "$arg" == *"$pattern" ]]; then
-          should_skip_inject=1
-          matched_arg="$arg"
-          break 2
-        fi
-      done
-      ;;
-    esac
-  done
-fi
-
-if [[ $should_skip_inject -eq 1 ]]; then
-  printf 'timestamp=%s stage=%s lang=%s compiler=%s inject="%s" argv="%s" note="%s"\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" \
-    "$stage_name" \
-    "$lang_name" \
-    "$compiler_bin" \
-    "<skipped>" \
-    "$argv_quoted" \
-    "matched_exclude=${matched_arg}" >>"$trace_file" || exit 1
-  exec "$compiler_bin" "$@"
-fi
 
 printf 'timestamp=%s stage=%s lang=%s compiler=%s inject="%s" argv="%s"\n' \
   "$(date '+%Y-%m-%d %H:%M:%S')" \
