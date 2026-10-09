@@ -49,7 +49,9 @@ function profiling () {
     echo "[ERROR] Unsupport arch: ${get_arch}"
     exit 1
   fi
-  perf record -e ${perf_event} -o ${profile_data_path}/${profile_name} -p ${process_id} -- sleep ${perf_time} >>${log_file} 2>&1
+  local perf_sleep="${perf_time:-0}"
+  [[ "$perf_sleep" == "0" ]] && perf_sleep="infinity"
+  perf record -e ${perf_event} -o ${profile_data_path}/${profile_name} -p ${process_id} -- sleep "${perf_sleep}" >>${log_file} 2>&1
   is_file_exist "${profile_data_path}/${profile_name}"
   create_gcov --binary=${bin_file} --profile=${profile_data_path}/${profile_name} --gcov=${profile_data_path}/${gcov_name} --gcov_version=1 --use_lbr=${use_lbr} >>${log_file} 2>&1
   is_file_exist "${profile_data_path}/${gcov_name}"

@@ -1,6 +1,9 @@
 #!/bin/bash
+
+set -o pipefail
+
 afot_path=$(cd "$(dirname "$0")" && pwd)
-config_file=${afot_path}/a-fot.ini
+config_file="${afot_path}/a-fot.ini"
 
 # profile名字
 profile_name="profile.data"
@@ -9,107 +12,912 @@ gcov_name="profile.gcov"
 # 内核编译选项
 kernel_configs=()
 
-# 解析配置文件配置项
-function parse_config() {
-  if [[ ! -f ${config_file} ]]; then
-    echo "[ERROR] Could not load config file at: ${config_file}, please check!"
-    exit 1
+declare -A config_sources=()
+declare -A stage_states=()
+declare -A substage_status=()
+declare -A substage_title=()
+declare -A substage_log=()
+declare -A substage_start=()
+declare -A substage_end=()
+declare -A substage_duration=()
+declare -A substage_artifacts=()
+declare -A substage_focus=()
+declare -A compile_trace_reports=()
+declare -A allowed_config_keys=(
+  [opt_mode]=1
+  [perf_time]=1
+  [application_name]=1
+  [bin_file]=1
+  [build_script]=1
+  [work_path]=1
+  [run_script]=1
+  [max_waiting_time]=1
+  [compiler]=1
+  [compiler_path]=1
+  [check_success]=1
+  [build_mode]=1
+  [pgo_mode]=1
+  [pgo_phase]=1
+  [kernel_src]=1
+  [kernel_name]=1
+  [run_time]=1
+  [last_time]=1
+  [makefile]=1
+  [kernel_config]=1
+  [data_dir]=1
+  [stable_root]=1
+  [cleanup_backup_dirs]=1
+  [start_substage]=1
+)
+
+stage_order=(
+  "parse_config"
+  "validate_config"
+  "init_runtime"
+  "load_script"
+  "check_dependency"
+  "optimization_flow"
+)
+
+cfgo_substages=(
+  "01-build-raw"
+  "02-run-raw"
+  "03-build-cfgo-pgo"
+  "04-run-cfgo-pgo"
+  "05-build-cfgo-cspgo"
+  "06-run-cfgo-cspgo"
+  "07-bolt-instrument"
+  "08-run-bolt"
+  "09-bolt-optimize"
+)
+
+summary_keys=(
+  "config_file"
+  "opt_mode"
+  "work_path"
+  "stable_root"
+  "cleanup_backup_dirs"
+  "start_substage"
+  "run_script"
+  "compiler"
+  "compiler_path"
+  "application_name"
+  "bin_file"
+  "build_script"
+  "max_waiting_time"
+  "perf_time"
+  "check_success"
+  "build_mode"
+)
+
+run_id=""
+start_time=""
+run_start_epoch=""
+run_end_epoch=""
+current_stage="startup"
+current_substage=""
+current_substage_log=""
+current_substage_title=""
+profile_data_path=""
+log_file=""
+summary_file=""
+logs_dir=""
+artifacts_dir=""
+wrappers_dir=""
+profiles_dir=""
+compile_trace_file=""
+run_status="运行中"
+failure_message=""
+failure_hint=""
+failure_stage=""
+failure_log_excerpt=""
+compile_trace_mode_note="当前未生成编译 trace。"
+cfgo_effective_start_substage=""
+run_script_pid=""
+heartbeat_interval="${A_FOT_HEARTBEAT_INTERVAL:-60}"
+bear_prefix=""
+verbose_mode=0
+
+function trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+function format_duration() {
+  local total_seconds="${1:-0}"
+  if [[ -z "$total_seconds" || "$total_seconds" -lt 0 ]]; then
+    total_seconds=0
   fi
-  while read line || [[ -n ${line} ]]; do
-    if [[ ! ${line} =~ "#" ]] && [[ ${line} != "" ]]; then
-      key=$(echo ${line} | awk -F "=" '{print $1}')
-      value=$(echo ${line} | awk -F "=" '{print $2}')
-      if [[ ${key} =~ "CONFIG_" ]]; then
-        kernel_configs+=("${key}=${value}")
-      else
-        eval "${key}=${value}"
-      fi
+
+  local hours=$((total_seconds / 3600))
+  local minutes=$(((total_seconds % 3600) / 60))
+  local seconds=$((total_seconds % 60))
+
+  if [[ "$hours" -gt 0 ]]; then
+    printf '%dh%02dm%02ds' "$hours" "$minutes" "$seconds"
+  elif [[ "$minutes" -gt 0 ]]; then
+    printf '%dm%02ds' "$minutes" "$seconds"
+  else
+    printf '%ds' "$seconds"
+  fi
+}
+
+function calc_duration_between() {
+  local start_value="$1"
+  local end_value="${2:-$(date '+%Y-%m-%d %H:%M:%S')}"
+  local start_epoch end_epoch
+
+  start_epoch=$(date -d "$start_value" +%s 2>/dev/null || echo "")
+  end_epoch=$(date -d "$end_value" +%s 2>/dev/null || echo "")
+
+  if [[ -z "$start_epoch" || -z "$end_epoch" ]]; then
+    printf '%s' "N/A"
+    return
+  fi
+
+  format_duration "$((end_epoch - start_epoch))"
+}
+
+function summarize_artifacts_inline() {
+  local stage_id="$1"
+  local artifact_text="${substage_artifacts[$stage_id]:-}"
+  local line
+  local count=0
+  local summary=""
+
+  if [[ -z "$artifact_text" ]]; then
+    printf '%s' "无"
+    return
+  fi
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ $count -ge 2 ]]; then
+      summary+=", ..."
+      break
     fi
-  done <${config_file}
+    if [[ -n "$summary" ]]; then
+      summary+=", "
+    fi
+    summary+="$line"
+    ((count++))
+  done <<<"$artifact_text"
+
+  printf '%s' "$summary"
+}
+
+function detect_focus_for_stage() {
+  local stage_id="$1"
+  case "$stage_id" in
+  *build* | *instrument*)
+    printf '输入脚本=%s | 输出产物=%s' "${build_script:-N/A}" "${bin_file:-N/A}"
+    ;;
+  *run*)
+    printf '运行脚本=%s | 目标进程=%s | 采样时长=%ss' "${run_script:-N/A}" "${application_name:-N/A}" "${perf_time:-N/A}"
+    ;;
+  *optimize)
+    printf '输入二进制=%s | 输出二进制=%s' "${bin_file:-N/A}" "${bin_file:-N/A}"
+    ;;
+  *)
+    printf '构建脚本=%s | 运行脚本=%s' "${build_script:-N/A}" "${run_script:-N/A}"
+    ;;
+  esac
+}
+
+function record_config_source() {
+  local key="$1"
+  local source="$2"
+  config_sources["$key"]="$source"
+}
+
+function mark_stage_started() {
+  current_stage="$1"
+  stage_states["$1"]="运行中"
+  write_summary
+}
+
+function mark_stage_success() {
+  local stage="$1"
+  stage_states["$stage"]="成功"
+  write_summary
+}
+
+function mark_stage_failed() {
+  local stage="$1"
+  stage_states["$stage"]="失败"
+  write_summary
+}
+
+function get_active_log_file() {
+  if [[ -n "$current_substage_log" ]]; then
+    printf '%s' "$current_substage_log"
+  else
+    printf '%s' "$log_file"
+  fi
+}
+
+function set_stage_log() {
+  local stage_id="$1"
+  current_substage_log="${logs_dir}/${stage_id}.log"
+  substage_log["$stage_id"]="$current_substage_log"
+}
+
+function cfgo_substage_default_title() {
+  case "$1" in
+  "01-build-raw") printf '%s' "原始构建" ;;
+  "02-run-raw") printf '%s' "原始运行" ;;
+  "03-build-cfgo-pgo") printf '%s' "CFGO-PGO 构建" ;;
+  "04-run-cfgo-pgo") printf '%s' "CFGO-PGO 运行" ;;
+  "05-build-cfgo-cspgo") printf '%s' "CFGO-CSPGO 构建" ;;
+  "06-run-cfgo-cspgo") printf '%s' "CFGO-CSPGO 运行" ;;
+  "07-bolt-instrument") printf '%s' "BOLT 插桩" ;;
+  "08-run-bolt") printf '%s' "BOLT 插桩运行" ;;
+  "09-bolt-optimize") printf '%s' "BOLT 优化" ;;
+  *) printf '%s' "未命名阶段" ;;
+  esac
+}
+
+function cfgo_substage_index() {
+  local target="$1"
+  local idx
+  for idx in "${!cfgo_substages[@]}"; do
+    if [[ "${cfgo_substages[$idx]}" == "$target" ]]; then
+      printf '%s' "$idx"
+      return 0
+    fi
+  done
+  printf '%s' "-1"
+}
+
+function cfgo_progress_message() {
+  local stage_id="$1"
+  local current_index=0
+  local total_count="${#cfgo_substages[@]}"
+  local idx
+  for idx in "${!cfgo_substages[@]}"; do
+    if [[ "${cfgo_substages[$idx]}" == "$stage_id" ]]; then
+      current_index=$((idx + 1))
+      break
+    fi
+  done
+
+  if [[ $current_index -eq 0 ]]; then
+    printf '进度：[?????????] 未知阶段 %s' "$stage_id"
+    return
+  fi
+
+  local filled=$current_index
+  local empty=$((total_count - filled))
+  local bar
+  bar=$(printf '%0.s#' $(seq 1 "$filled"))
+  if [[ $empty -gt 0 ]]; then
+    bar+=$(printf '%0.s-' $(seq 1 "$empty"))
+  fi
+  printf '进度：[%s] %d/%d' "$bar" "$current_index" "$total_count"
+}
+
+function log_runtime_paths() {
+  log_status "运行目录就绪 | 运行目录=${profile_data_path} | 主日志=${log_file} | Summary=${summary_file}"
+  log_info "输出归档：logs=${logs_dir} | artifacts=${artifacts_dir} | profiles=${profiles_dir}"
+  log_info "编译注入：trace=${compile_trace_file} | wrappers=${compiler_wrapper}"
+  if [[ -n "${cfgo_effective_start_substage:-}" ]]; then
+    log_info "CFGO 起跑阶段：${cfgo_effective_start_substage}"
+  fi
+}
+
+function start_substage() {
+  local stage_id="$1"
+  local title="$2"
+  local progress focus
+  current_substage="$stage_id"
+  current_substage_title="$title"
+  substage_title["$stage_id"]="$title"
+  substage_status["$stage_id"]="运行中"
+  substage_start["$stage_id"]="$(date '+%Y-%m-%d %H:%M:%S')"
+  substage_end["$stage_id"]=""
+  substage_duration["$stage_id"]=""
+  set_stage_log "$stage_id"
+  : >"$current_substage_log"
+  {
+    printf '阶段ID: %s\n' "$stage_id"
+    printf '阶段标题: %s\n' "$title"
+    printf '开始时间: %s\n\n' "${substage_start[$stage_id]}"
+  } >>"$current_substage_log"
+  progress=$(cfgo_progress_message "$stage_id")
+  focus=$(detect_focus_for_stage "$stage_id")
+  substage_focus["$stage_id"]="$focus"
+  log_status "阶段开始 | ${progress} | ${title} | stage=${stage_id}"
+  log_info "阶段焦点：${focus}"
+  log_info "阶段日志：${current_substage_log}"
+  write_summary
+}
+
+function finish_substage() {
+  local stage_id="$1"
+  local start_epoch end_epoch end_value duration_seconds progress
+  end_value=$(date '+%Y-%m-%d %H:%M:%S')
+  substage_end["$stage_id"]="$end_value"
+  if [[ -n "${substage_start[$stage_id]}" ]]; then
+    start_epoch=$(date -d "${substage_start[$stage_id]}" +%s 2>/dev/null || echo "")
+    end_epoch=$(date -d "$end_value" +%s 2>/dev/null || echo "")
+    if [[ -n "$start_epoch" && -n "$end_epoch" ]]; then
+      duration_seconds=$((end_epoch - start_epoch))
+      substage_duration["$stage_id"]="$(format_duration "$duration_seconds")"
+    fi
+  fi
+  substage_status["$stage_id"]="成功"
+  progress=$(cfgo_progress_message "$stage_id")
+  log_status "阶段完成 | ${progress} | ${substage_title[$stage_id]} | 耗时=${substage_duration[$stage_id]:-N/A} | 产物=$(summarize_artifacts_inline "$stage_id")"
+  current_substage=""
+  current_substage_title=""
+  current_substage_log=""
+  write_summary
+}
+
+function mark_substage_skipped() {
+  local stage_id="$1"
+  local title="$2"
+  local reason="$3"
+  substage_title["$stage_id"]="$title"
+  substage_status["$stage_id"]="已跳过"
+  substage_log["$stage_id"]="N/A"
+  substage_start["$stage_id"]=""
+  substage_end["$stage_id"]=""
+  substage_duration["$stage_id"]=""
+  substage_focus["$stage_id"]="跳过"
+  substage_artifacts["$stage_id"]="跳过原因：${reason}"
+  write_summary
+}
+
+function record_substage_artifact() {
+  local message="$1"
+  local stage_id="${current_substage:-}"
+  if [[ -z "$stage_id" ]]; then
+    return
+  fi
+  if [[ -n "${substage_artifacts[$stage_id]}" ]]; then
+    substage_artifacts["$stage_id"]+=$'\n'
+  fi
+  substage_artifacts["$stage_id"]+="$message"
+}
+
+function run_substage() {
+  local stage_id="$1"
+  local title="$2"
+  shift 2
+  start_substage "$stage_id" "$title"
+  "$@"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    fail_stage "optimization_flow" "$rc" "子阶段 '${stage_id}' 执行失败。" "请查看阶段日志：${current_substage_log}"
+  fi
+  finish_substage "$stage_id"
+}
+
+function append_log() {
+  local level="$1"
+  local message="$2"
+  local line
+  line=$(printf '[%s] [%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$message")
+  if should_print_to_stdout "$level" "$message"; then
+    echo "$line"
+  fi
+  if [[ -n "$log_file" ]]; then
+    printf '%s\n' "$line" >>"$log_file"
+  fi
+  if [[ -n "$current_substage_log" && "$current_substage_log" != "$log_file" ]]; then
+    printf '%s\n' "$line" >>"$current_substage_log"
+  fi
+}
+
+function should_print_to_stdout() {
+  local level="$1"
+  local message="$2"
+
+  if [[ "${verbose_mode}" == "1" ]]; then
+    return 0
+  fi
+
+  case "$level" in
+  ERROR | WARNING)
+    return 0
+    ;;
+  STATUS)
+    case "$message" in
+    "执行计划"* | "阶段开始"* | "阶段完成"* | "阶段失败"* | "阶段跳过"* | "开始原始构建"* | "开始优化构建"* | "开始运行阶段"* | *"进行中 | 已运行 "* | "等待 "*"启动"* | "目标进程已启动"* | "开始等待 workload 结束"* | "等待 "*"退出"* | "workload 已结束"* | "优化流程执行完成。" )
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+    esac
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+function log_info() {
+  append_log "INFO" "$1"
+}
+
+function log_status() {
+  append_log "STATUS" "$1"
+}
+
+function log_warn() {
+  append_log "WARNING" "$1"
+}
+
+function log_error() {
+  append_log "ERROR" "$1"
+}
+
+function collect_failure_excerpt() {
+  local target_log="$1"
+  if [[ -z "$target_log" || ! -f "$target_log" ]]; then
+    failure_log_excerpt=""
+    return
+  fi
+
+  failure_log_excerpt=$(tail -n 120 "$target_log" | grep -E "error:|undefined reference|CMake Error|make(\[[0-9]+\])?: \*\*\*|FAILED:|No rule to make target|collect2: error|fatal error:" | tail -n 12 || true)
+  if [[ -z "$failure_log_excerpt" ]]; then
+    failure_log_excerpt=$(tail -n 20 "$target_log" || true)
+  fi
+}
+
+function log_failure_excerpt() {
+  local line
+  [[ -z "${failure_log_excerpt:-}" ]] && return
+  log_error "失败摘要："
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    log_error "  ${line}"
+  done <<<"${failure_log_excerpt}"
+}
+
+function run_logged_command() {
+  local task_label="$1"
+  local stage_log="$2"
+  shift 2
+
+  "$@" >>"${stage_log}" 2>&1 &
+  local cmd_pid=$!
+  local elapsed=0
+
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    sleep 1
+    ((elapsed++))
+    if [[ $((elapsed % heartbeat_interval)) -eq 0 ]]; then
+      log_status "${task_label}进行中 | 已运行 $(format_duration "$elapsed") | 日志持续写入 ${stage_log}"
+    fi
+  done
+
+  wait "$cmd_pid"
+  return $?
+}
+
+function write_summary() {
+  local total_duration="N/A"
+  local active_stage_log="${current_substage_log:-N/A}"
+  local key value source stage substage artifact_line report_line excerpt_line
+
+  if [[ -z "$summary_file" ]]; then
+    return
+  fi
+
+  if [[ -n "${failure_stage:-}" && -n "${substage_log[$failure_stage]:-}" ]]; then
+    active_stage_log="${substage_log[$failure_stage]}"
+  fi
+
+  if [[ -n "${run_end_epoch:-}" && -n "${run_start_epoch:-}" ]]; then
+    total_duration=$(format_duration "$((run_end_epoch - run_start_epoch))")
+  elif [[ -n "${run_start_epoch:-}" ]]; then
+    total_duration=$(format_duration "$(( $(date +%s) - run_start_epoch ))")
+  fi
+
+  {
+    printf '运行结论:\n'
+    printf '  结果: %s\n' "${run_status:-运行中}"
+    printf '  当前模式: %s\n' "${opt_mode:-N/A}"
+    printf '  失败/停留阶段: %s\n' "${failure_stage:-${current_substage:-N/A}}"
+    printf '  直接原因: %s\n' "${failure_message:-N/A}"
+    printf '  建议动作: %s\n' "${failure_hint:-N/A}"
+    printf '  总耗时: %s\n' "${total_duration}"
+    printf '  主日志: %s\n' "${log_file:-N/A}"
+    printf '  当前阶段日志: %s\n' "${active_stage_log:-N/A}"
+    if [[ -n "${failure_log_excerpt:-}" ]]; then
+      printf '  最近错误摘要:\n'
+      while IFS= read -r excerpt_line; do
+        [[ -n "$excerpt_line" ]] && printf '    %s\n' "$excerpt_line"
+      done <<<"${failure_log_excerpt}"
+    fi
+
+    printf '\n运行元信息:\n'
+    printf '  运行ID: %s\n' "${run_id:-N/A}"
+    printf '  开始时间: %s\n' "${start_time:-N/A}"
+    printf '  配置文件: %s\n' "${config_file:-N/A}"
+    printf '  CFGO起始子阶段: %s\n' "${cfgo_effective_start_substage:-${start_substage:-01-build-raw}}"
+
+    printf '\n关键配置:\n'
+    printf '  build_script=%s\n' "${build_script:-N/A}"
+    printf '  run_script=%s\n' "${run_script:-N/A}"
+    printf '  bin_file=%s\n' "${bin_file:-N/A}"
+    printf '  application_name=%s\n' "${application_name:-N/A}"
+    printf '  compiler=%s\n' "${compiler:-N/A}"
+    printf '  compiler_path=%s\n' "${compiler_path:-N/A}"
+    printf '  build_mode=%s\n' "${build_mode:-N/A}"
+    printf '  perf_time=%s\n' "${perf_time:-N/A}"
+
+    printf '\n生效配置:\n'
+    for key in "${summary_keys[@]}"; do
+      if [[ "$key" == "config_file" ]]; then
+        value="$config_file"
+      else
+        value="${!key}"
+      fi
+      source="${config_sources[$key]:-unset}"
+      printf '  %s=%s (source=%s)\n' "$key" "${value:-<unset>}" "$source"
+    done
+
+    printf '\n主阶段状态:\n'
+    for stage in "${stage_order[@]}"; do
+      printf '  %s: %s\n' "$stage" "${stage_states[$stage]:-PENDING}"
+    done
+
+    printf '\n子阶段概览:\n'
+    for substage in "${cfgo_substages[@]}"; do
+      printf '  %s | %s | 状态=%s | 耗时=%s | 日志=%s\n' \
+        "$substage" \
+        "${substage_title[$substage]:-未执行}" \
+        "${substage_status[$substage]:-未开始}" \
+        "${substage_duration[$substage]:-N/A}" \
+        "${substage_log[$substage]:-N/A}"
+    done
+
+    printf '\n子阶段详情:\n'
+    for substage in "${cfgo_substages[@]}"; do
+      printf '  %s [%s]\n' "$substage" "${substage_title[$substage]:-未执行}"
+      printf '    状态: %s\n' "${substage_status[$substage]:-未开始}"
+      printf '    焦点: %s\n' "${substage_focus[$substage]:-N/A}"
+      printf '    日志: %s\n' "${substage_log[$substage]:-N/A}"
+      printf '    开始: %s\n' "${substage_start[$substage]:-N/A}"
+      printf '    结束: %s\n' "${substage_end[$substage]:-N/A}"
+      printf '    耗时: %s\n' "${substage_duration[$substage]:-N/A}"
+      if [[ -n "${substage_artifacts[$substage]}" ]]; then
+        printf '    产物:\n'
+        while IFS= read -r artifact_line; do
+          printf '      - %s\n' "$artifact_line"
+        done <<<"${substage_artifacts[$substage]}"
+      fi
+    done
+
+    printf '\n编译Trace摘要:\n'
+    printf '  模式说明: %s\n' "${compile_trace_mode_note}"
+    for substage in "${cfgo_substages[@]}"; do
+      if [[ -n "${compile_trace_reports[$substage]}" ]]; then
+        printf '  [%s]\n' "$substage"
+        while IFS= read -r report_line; do
+          printf '    %s\n' "$report_line"
+        done <<<"${compile_trace_reports[$substage]}"
+      fi
+    done
+
+    printf '\n输出路径:\n'
+    printf '  runtime=%s\n' "${profile_data_path:-N/A}"
+    printf '  logs=%s\n' "${logs_dir:-N/A}"
+    printf '  artifacts=%s\n' "${artifacts_dir:-N/A}"
+    printf '  wrappers=%s\n' "${wrappers_dir:-N/A}"
+    printf '  profiles=%s\n' "${profiles_dir:-N/A}"
+    printf '  compiler_wrapper=%s\n' "${compiler_wrapper:-N/A}"
+    printf '  compile_trace=%s\n' "${compile_trace_file:-N/A}"
+  } >"$summary_file"
+}
+
+function fail_stage() {
+  local stage="$1"
+  local code="$2"
+  local message="$3"
+  local hint="${4:-请检查配置和日志后重试。}"
+  local actual_stage="${current_substage:-$stage}"
+
+  current_stage="$stage"
+  run_status="失败"
+  run_end_epoch=$(date +%s)
+  failure_stage="$actual_stage"
+  failure_message="$message"
+  failure_hint="$hint"
+  mark_stage_failed "$stage"
+  if [[ -n "$current_substage" ]]; then
+    substage_status["$current_substage"]="失败"
+    substage_end["$current_substage"]="$(date '+%Y-%m-%d %H:%M:%S')"
+    substage_duration["$current_substage"]="$(calc_duration_between "${substage_start[$current_substage]}" "${substage_end[$current_substage]}")"
+  fi
+  collect_failure_excerpt "${current_substage_log:-$log_file}"
+  write_summary
+
+  log_status "阶段失败 | stage=${actual_stage} | code=${code} | 建议=${hint}"
+  log_error "阶段 '${actual_stage}' 执行失败，退出码 ${code}：${message}"
+  log_error "主日志：${log_file:-未初始化}"
+  if [[ -n "$current_substage_log" ]]; then
+    log_error "阶段日志：${current_substage_log}"
+  fi
+  log_failure_excerpt
+  log_error "建议：${hint}"
+  exit "$code"
+}
+
+function finish_success() {
+  run_status="成功"
+  run_end_epoch=$(date +%s)
+  failure_stage=""
+  failure_message="全部阶段执行完成。"
+  failure_hint="可查看 run-summary.txt 与 artifacts 目录确认优化结果。"
+  failure_log_excerpt=""
+  write_summary
+  exit 0
+}
+
+function init_runtime_context() {
+  run_id=$(date '+%Y%m%d-%H%M%S')
+  start_time=$(date '+%Y-%m-%d %H:%M:%S')
+  run_start_epoch=$(date +%s)
+  record_config_source "config_file" "default"
+}
+
+function parse_config_file_arg() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --config_file)
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--config_file' requires a value." "Pass an absolute path after --config_file."
+      fi
+      config_file="$2"
+      record_config_source "config_file" "cli"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+    esac
+  done
+}
+
+function set_config_value() {
+  local key="$1"
+  local value="$2"
+  printf -v "$key" '%s' "$value"
+}
+
+function parse_config() {
+  if [[ ! -f "$config_file" ]]; then
+    fail_stage "parse_config" 1 "Could not load config file at '${config_file}'." "Check that the config file path exists and is readable."
+  fi
+
+  local line trimmed_line key value line_no=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_no++))
+    trimmed_line=$(trim_whitespace "$line")
+    if [[ -z "$trimmed_line" ]] || [[ "$trimmed_line" == \#* ]]; then
+      continue
+    fi
+    if [[ "$trimmed_line" != *"="* ]]; then
+      fail_stage "parse_config" 1 "Invalid config line ${line_no}: '${line}'." "Use the 'key=value' format in ${config_file}."
+    fi
+
+    key=$(trim_whitespace "${trimmed_line%%=*}")
+    value=$(trim_whitespace "${trimmed_line#*=}")
+
+    if [[ -z "$key" ]]; then
+      fail_stage "parse_config" 1 "Config line ${line_no} has an empty key: '${line}'." "Provide a valid config key before '='."
+    fi
+
+    if [[ "$key" == CONFIG_* ]]; then
+      kernel_configs+=("${key}=${value}")
+      continue
+    fi
+
+    if [[ -z "${allowed_config_keys[$key]}" ]]; then
+      fail_stage "parse_config" 1 "Unknown config item '${key}' on line ${line_no}: '${line}'." "Remove the unsupported config item or add a supported key."
+    fi
+
+    set_config_value "$key" "$value"
+    record_config_source "$key" "config_file"
+  done <"$config_file"
 }
 
 # 解析输入的参数
 function parse_input_params() {
-  while [ $# -ge 2 ]; do
-    case $1 in
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
     --opt_mode)
-      opt_mode=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--opt_mode' requires a value." "Pass a value after --opt_mode."
+      fi
+      opt_mode="$2"
+      record_config_source "opt_mode" "cli"
       shift 2
       ;;
     --perf_time)
-      perf_time=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--perf_time' requires a value." "Pass a value after --perf_time."
+      fi
+      perf_time="$2"
+      record_config_source "perf_time" "cli"
       shift 2
       ;;
     --app_name)
-      application_name=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--app_name' requires a value." "Pass a value after --app_name."
+      fi
+      application_name="$2"
+      record_config_source "application_name" "cli"
       shift 2
       ;;
     --bin_file)
-      bin_file=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--bin_file' requires a value." "Pass a value after --bin_file."
+      fi
+      bin_file="$2"
+      record_config_source "bin_file" "cli"
       shift 2
       ;;
     --build_script)
-      build_script=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--build_script' requires a value." "Pass a value after --build_script."
+      fi
+      build_script="$2"
+      record_config_source "build_script" "cli"
       shift 2
       ;;
     --work_path)
-      work_path=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--work_path' requires a value." "Pass a value after --work_path."
+      fi
+      work_path="$2"
+      record_config_source "work_path" "cli"
       shift 2
       ;;
     --run_script)
-      run_script=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--run_script' requires a value." "Pass a value after --run_script."
+      fi
+      run_script="$2"
+      record_config_source "run_script" "cli"
+      shift 2
+      ;;
+    --stable_root)
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--stable_root' requires a value." "Pass a value after --stable_root."
+      fi
+      stable_root="$2"
+      record_config_source "stable_root" "cli"
+      shift 2
+      ;;
+    --cleanup_backup_dirs)
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--cleanup_backup_dirs' requires a value." "Pass a value after --cleanup_backup_dirs."
+      fi
+      cleanup_backup_dirs="$2"
+      record_config_source "cleanup_backup_dirs" "cli"
+      shift 2
+      ;;
+    --start_substage)
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--start_substage' requires a value." "Pass a value after --start_substage."
+      fi
+      start_substage="$2"
+      record_config_source "start_substage" "cli"
       shift 2
       ;;
     --max_waiting_time)
-      max_waiting_time=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--max_waiting_time' requires a value." "Pass a value after --max_waiting_time."
+      fi
+      max_waiting_time="$2"
+      record_config_source "max_waiting_time" "cli"
       shift 2
       ;;
     --compiler)
-      compiler=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--compiler' requires a value." "Pass a value after --compiler."
+      fi
+      compiler="$2"
+      record_config_source "compiler" "cli"
       shift 2
       ;;
     --compiler_path)
-      compiler_path=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--compiler_path' requires a value." "Pass a value after --compiler_path."
+      fi
+      compiler_path="$2"
+      record_config_source "compiler_path" "cli"
       shift 2
-      ;;  
+      ;;
     --config_file)
-      config_file=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--config_file' requires a value." "Pass an absolute path after --config_file."
+      fi
+      config_file="$2"
+      record_config_source "config_file" "cli"
       shift 2
       ;;
     --check_success)
-      check_success=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--check_success' requires a value." "Pass a value after --check_success."
+      fi
+      check_success="$2"
+      record_config_source "check_success" "cli"
       shift 2
       ;;
     --build_mode)
-      build_mode=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--build_mode' requires a value." "Pass a value after --build_mode."
+      fi
+      build_mode="$2"
+      record_config_source "build_mode" "cli"
       shift 2
       ;;
+    --verbose)
+      verbose_mode=1
+      shift
+      ;;
     --pgo_mode)
-      pgo_mode=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--pgo_mode' requires a value." "Pass a value after --pgo_mode."
+      fi
+      pgo_mode="$2"
+      record_config_source "pgo_mode" "cli"
       shift 2
       ;;
     --pgo_phase)
-      pgo_phase=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--pgo_phase' requires a value." "Pass a value after --pgo_phase."
+      fi
+      pgo_phase="$2"
+      record_config_source "pgo_phase" "cli"
       shift 2
       ;;
     --kernel_src)
-      kernel_src=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--kernel_src' requires a value." "Pass a value after --kernel_src."
+      fi
+      kernel_src="$2"
+      record_config_source "kernel_src" "cli"
       shift 2
       ;;
     --kernel_name)
-      kernel_name=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--kernel_name' requires a value." "Pass a value after --kernel_name."
+      fi
+      kernel_name="$2"
+      record_config_source "kernel_name" "cli"
       shift 2
       ;;
     --run_time)
-      run_time=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--run_time' requires a value." "Pass a value after --run_time."
+      fi
+      run_time="$2"
+      record_config_source "run_time" "cli"
       shift 2
       ;;
     --CONFIG_*)
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '$1' requires a value." "Pass a value after the kernel config option."
+      fi
       kernel_configs+=("${1:2}=$2")
       shift 2
       ;;
     --last_time)
-      last_time=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--last_time' requires a value." "Pass a value after --last_time."
+      fi
+      last_time="$2"
+      record_config_source "last_time" "cli"
       shift 2
       ;;
     -s)
@@ -121,67 +929,146 @@ function parse_input_params() {
       shift
       ;;
     --makefile)
-      makefile=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--makefile' requires a value." "Pass a value after --makefile."
+      fi
+      makefile="$2"
+      record_config_source "makefile" "cli"
       shift 2
       ;;
     --kernel_config)
-      kernel_config=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--kernel_config' requires a value." "Pass a value after --kernel_config."
+      fi
+      kernel_config="$2"
+      record_config_source "kernel_config" "cli"
       shift 2
       ;;
     --data_dir)
-      data_dir=$2
+      if [[ $# -lt 2 ]]; then
+        fail_stage "parse_config" 1 "Option '--data_dir' requires a value." "Pass a value after --data_dir."
+      fi
+      data_dir="$2"
+      record_config_source "data_dir" "cli"
       shift 2
       ;;
     *)
       suggest_info
-      exit 1
+      fail_stage "parse_config" 1 "Unsupported option '$1'." "Check the command line options and try again."
       ;;
     esac
   done
+}
 
-  if [[ $# == 1 ]]; then
-    if [[ $1 == "-s" ]]; then
-      silent=1
-    elif [[ $1 == "-n" ]]; then
-      disable_compilation=1
-    else
-      suggest_info
-      exit 1
+function check_item() {
+  local value="$1"
+  local item_name="$2"
+  if [[ -z "$value" ]]; then
+    fail_stage "validate_config" 1 "The configuration item '${item_name}' is missing." "Update ${config_file} or provide the matching command line option."
+  fi
+}
+
+function validate_cfgo_config() {
+  check_item "${application_name:-}" "application_name"
+  check_item "${bin_file:-}" "bin_file"
+  check_item "${work_path:-}" "work_path"
+  check_item "${build_script:-}" "build_script"
+  check_item "${run_script:-}" "run_script"
+  check_item "${max_waiting_time:-}" "max_waiting_time"
+  check_item "${opt_mode:-}" "opt_mode"
+  check_item "${perf_time:-}" "perf_time"
+  check_item "${compiler:-}" "compiler"
+  check_item "${compiler_path:-}" "compiler_path"
+  check_item "${check_success:-}" "check_success"
+  check_item "${build_mode:-}" "build_mode"
+
+  if [[ "$build_mode" != "Wrapper" && "$build_mode" != "Bear" ]]; then
+    fail_stage "validate_config" 1 "Invalid build_mode='${build_mode}' for AutoCFGO." "Use 'Wrapper' or 'Bear'."
+  fi
+
+  if [[ "$check_success" != "0" && "$check_success" != "1" ]]; then
+    fail_stage "validate_config" 1 "Invalid check_success='${check_success}' for AutoCFGO." "Use '0' or '1'."
+  fi
+
+  if [[ "$compiler" != "gcc" ]]; then
+    fail_stage "validate_config" 1 "AutoCFGO only supports gcc, but compiler='${compiler}'." "Set compiler=gcc in ${config_file} or pass '--compiler gcc'."
+  fi
+
+  if [[ -n "${start_substage:-}" ]]; then
+    if [[ "$(cfgo_substage_index "${start_substage}")" -lt 0 ]]; then
+      fail_stage "validate_config" 1 "Invalid start_substage='${start_substage}' for AutoCFGO." "Use one of: ${cfgo_substages[*]}."
+    fi
+    # 从非初始子阶段恢复时，校验所需 profile/二进制是否存在
+    local resume_index
+    resume_index=$(cfgo_substage_index "${start_substage}")
+    if [[ "$resume_index" -gt 0 ]]; then
+      if [[ -z "${last_time:-}" ]]; then
+        fail_stage "validate_config" 1 \
+          "start_substage=${start_substage} 需要从已有运行目录恢复，但未指定 --last_time。" \
+          "请通过 --last_time 指定上一次运行的目录时间戳。"
+      fi
+      local check_profiles_dir="${work_path}/${last_time}/profiles"
+      # 从 05-build-cfgo-cspgo 或更晚恢复时，需要 cfgo-pgo profile
+      if [[ "$resume_index" -ge 4 ]]; then
+        local pgo_dir="${check_profiles_dir}/cfgo-pgo"
+        if [[ ! -d "$pgo_dir" ]] || [[ -z "$(ls -A "$pgo_dir" 2>/dev/null)" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 cfgo-pgo profile，但 ${pgo_dir} 为空或不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
+      # 从 07-bolt-instrument 或更晚恢复时，需要 cfgo-cspgo profile
+      if [[ "$resume_index" -ge 6 ]]; then
+        local cspgo_dir="${check_profiles_dir}/cfgo-cspgo"
+        if [[ ! -d "$cspgo_dir" ]] || [[ -z "$(ls -A "$cspgo_dir" 2>/dev/null)" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 cfgo-cspgo profile，但 ${cspgo_dir} 为空或不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
+      # 从 09-bolt-optimize 恢复时，需要 bolt profile
+      if [[ "$resume_index" -ge 8 ]]; then
+        local bolt_dir="${check_profiles_dir}/cfgo-bolt"
+        if [[ ! -d "$bolt_dir" ]] || [[ ! -f "${bolt_dir}/bolt.inst.fdata" ]]; then
+          fail_stage "validate_config" 1 \
+            "start_substage=${start_substage} 需要 BOLT profile，但 ${bolt_dir}/bolt.inst.fdata 不存在。" \
+            "请确认 --last_time 指向正确的运行目录。"
+        fi
+      fi
     fi
   fi
 }
 
-# 检查某个配置项是否存在
-function check_item() {
-  if [[ -z $1 ]]; then
-    echo "[ERROR] The configuration item '$2' is missing, please check!"
-    exit 1
-  fi
-}
-
 function check_config_items() {
-  check_item ${application_name} application_name
-  check_item ${bin_file} bin_file
-  check_item ${work_path} work_path
-  check_item ${build_script} build_script
-  check_item ${run_script} run_script
-  check_item ${max_waiting_time} max_waiting_time
-  check_item ${opt_mode} opt_mode
-  check_item ${perf_time} perf_time
-  check_item ${compiler} compiler
-  check_item ${compiler_path} compiler_path
-  check_item ${check_success} check_success
-  check_item ${build_mode} build_mode
+  case "${opt_mode:-}" in
+  "AutoCFGO")
+    validate_cfgo_config
+    ;;
+  *)
+    check_item "${application_name:-}" "application_name"
+    check_item "${bin_file:-}" "bin_file"
+    check_item "${work_path:-}" "work_path"
+    check_item "${build_script:-}" "build_script"
+    check_item "${run_script:-}" "run_script"
+    check_item "${max_waiting_time:-}" "max_waiting_time"
+    check_item "${opt_mode:-}" "opt_mode"
+    check_item "${perf_time:-}" "perf_time"
+    check_item "${compiler:-}" "compiler"
+    check_item "${compiler_path:-}" "compiler_path"
+    check_item "${check_success:-}" "check_success"
+    check_item "${build_mode:-}" "build_mode"
+    ;;
+  esac
 }
 
 function suggest_info() {
-  echo """
+  cat <<'EOF'
 Usage: a-fot [OPTION1 ARG1] [OPTION2 ARG2] [...]
 
 For perf mode:
 --config_file       Path of configuration file
 --opt_mode          Optimization modes (AutoFDO/AutoBOLT/AutoPGO/AutoCFGO)
---perf_time         Perf sampling duration (unit: seconds)
+--perf_time         Perf sampling max duration in seconds (0 = unlimited, until process exits)
 --compiler          Compiler (gcc or llvm for now)
 --compiler_path     Compiler path
 --app_name          Application process name
@@ -192,6 +1079,7 @@ For perf mode:
 --max_waiting_time  Maximum binary startup time (unit: seconds)
 --check_success     Check optimization result
 --build_mode        Execute build script mode (Wrapper/Bear)
+--verbose           Print all logs to stdout, including detailed context
 
 For kernel PGO mode:
 --config_file       Path of configuration file
@@ -210,315 +1098,538 @@ For kernel PGO mode:
 --makefile          Makefile path of kernel
 --kernel_config     Config file path of kernel
 --data_dir          Profile path generated by kernel
-"""
+EOF
+}
+
+function print_effective_config_summary() {
+  log_status "关键配置 | mode=${opt_mode:-N/A} | build_mode=${build_mode:-N/A} | start=${cfgo_effective_start_substage:-${start_substage:-01-build-raw}}"
+  log_info "关键输入：build_script=${build_script:-<unset>} | run_script=${run_script:-<unset>} | bin_file=${bin_file:-<unset>}"
+  log_info "关键运行：application=${application_name:-<unset>} | perf_time=${perf_time:-<unset>}s | max_waiting_time=${max_waiting_time:-<unset>}s"
+  log_info "关键编译：compiler=${compiler:-<unset>} | compiler_path=${compiler_path:-<unset>} | config_file=${config_file:-<unset>}"
+}
+
+function run_cfgo_flow() {
+  local stage_ids=(
+    "01-build-raw"
+    "02-run-raw"
+    "03-build-cfgo-pgo"
+    "04-run-cfgo-pgo"
+    "05-build-cfgo-cspgo"
+    "06-run-cfgo-cspgo"
+    "07-bolt-instrument"
+    "08-run-bolt"
+    "09-bolt-optimize"
+  )
+  local stage_titles=(
+    "原始构建"
+    "原始运行"
+    "CFGO-PGO 构建"
+    "CFGO-PGO 运行"
+    "CFGO-CSPGO 构建"
+    "CFGO-CSPGO 运行"
+    "BOLT 插桩"
+    "BOLT 插桩运行"
+    "BOLT 优化"
+  )
+  local stage_funcs=(
+    "cfgo_stage_build_raw"
+    "cfgo_stage_run_raw"
+    "cfgo_stage_build_pgo"
+    "cfgo_stage_run_pgo"
+    "cfgo_stage_build_cspgo"
+    "cfgo_stage_run_cspgo"
+    "cfgo_stage_bolt_instrument"
+    "cfgo_stage_run_bolt"
+    "cfgo_stage_bolt_optimize"
+  )
+  local effective_start="${start_substage:-01-build-raw}"
+  local start_index
+  local idx
+
+  start_index=$(cfgo_substage_index "${effective_start}")
+  cfgo_effective_start_substage="${effective_start}"
+  log_status "执行计划 | AutoCFGO 从 ${cfgo_effective_start_substage} 开始 | 共 ${#stage_ids[@]} 个子阶段"
+  write_summary
+
+  for idx in "${!stage_ids[@]}"; do
+    if [[ "$idx" -lt "$start_index" ]]; then
+      mark_substage_skipped "${stage_ids[$idx]}" "${stage_titles[$idx]}" "配置要求从 ${cfgo_effective_start_substage} 开始执行。"
+      log_status "阶段跳过 | ${stage_titles[$idx]} | 原因=从 ${cfgo_effective_start_substage} 起跑"
+      continue
+    fi
+    run_substage "${stage_ids[$idx]}" "${stage_titles[$idx]}" "${stage_funcs[$idx]}"
+  done
+}
+
+function dump_file_to_logs() {
+  local title="$1"
+  local file_path="$2"
+  local detail_mode="${A_FOT_VERBOSE_WRAPPER:-$verbose_mode}"
+  if [[ ! -f "$file_path" ]]; then
+    return
+  fi
+
+  if [[ "$detail_mode" == "1" ]]; then
+    if [[ "${verbose_mode}" == "1" ]]; then
+      printf '\n===== %s: %s =====\n' "$title" "$file_path"
+      cat "$file_path"
+      printf '\n===== END %s =====\n' "$title"
+    fi
+    {
+      printf '\n===== %s: %s =====\n' "$title" "$file_path"
+      cat "$file_path"
+      printf '\n===== END %s =====\n' "$title"
+    } >>"$log_file"
+    if [[ -n "$current_substage_log" ]]; then
+      {
+        printf '\n===== %s: %s =====\n' "$title" "$file_path"
+        cat "$file_path"
+        printf '\n===== END %s =====\n' "$title"
+      } >>"$current_substage_log"
+    fi
+  else
+    log_info "${title} 已生成：${file_path}（默认不展开全文；如需完整内容可设置 A_FOT_VERBOSE_WRAPPER=1）"
+  fi
+}
+
+function analyze_compile_trace() {
+  local stage_id="$1"
+  shift
+
+  if [[ "$build_mode" != "Wrapper" ]]; then
+    compile_trace_mode_note="当前构建模式为 Bear，未启用精确 wrapper trace 校验。"
+    compile_trace_reports["$stage_id"]="构建模式为 Bear，跳过精确命中校验。"
+    write_summary
+    return 0
+  fi
+
+  compile_trace_mode_note="当前构建模式为 Wrapper，已启用精确 wrapper trace 校验。"
+
+  if [[ ! -f "$compile_trace_file" ]]; then
+    compile_trace_reports["$stage_id"]="trace文件不存在：${compile_trace_file}"
+    write_summary
+    if [[ "${check_success}" -eq 1 ]]; then
+      fail_stage "optimization_flow" 1 "未找到编译 trace 文件：${compile_trace_file}" "请检查构建脚本是否通过 wrapper 调用编译器。"
+    fi
+    return 0
+  fi
+
+  local stage_lines total_count report marker count sample line
+  stage_lines=$(grep "stage=${stage_id} " "$compile_trace_file" || true)
+  total_count=$(printf '%s\n' "$stage_lines" | sed '/^$/d' | wc -l)
+  report="trace文件=${compile_trace_file}"$'\n'"本阶段记录条数=${total_count}"
+
+  for marker in "$@"; do
+    count=$(printf '%s\n' "$stage_lines" | grep -c -- "$marker" || true)
+    sample=$(printf '%s\n' "$stage_lines" | grep -- "$marker" | head -n 1 || true)
+    report+=$'\n'"marker=${marker} 命中次数=${count}"
+    if [[ -n "$sample" ]]; then
+      report+=$'\n'"首次命中=${sample}"
+    fi
+    if [[ "${check_success}" -eq 1 && "$count" -eq 0 ]]; then
+      compile_trace_reports["$stage_id"]="$report"
+      write_summary
+      fail_stage "optimization_flow" 1 "子阶段 ${stage_id} 未命中期望编译参数：${marker}" "可能是构建脚本未使用 CC/CXX、绕过 wrapper，或构建阶段过短。"
+    fi
+  done
+
+  compile_trace_reports["$stage_id"]="$report"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log_info "[Trace:${stage_id}] $line"
+  done <<<"$report"
+  write_summary
 }
 
 # 根据模式加载不同的优化脚本
 function load_script() {
-  case ${opt_mode} in
+  case "${opt_mode}" in
   "AutoFDO")
-    source ${afot_path}/auto_fdo.sh
+    source "${afot_path}/auto_fdo.sh"
     ;;
   "AutoBOLT")
-    source ${afot_path}/auto_bolt.sh
+    source "${afot_path}/auto_bolt.sh"
     ;;
   "AutoPGO")
-    source ${afot_path}/auto_pgo.sh
+    source "${afot_path}/auto_pgo.sh"
     ;;
   "AutoCFGO")
-    source ${afot_path}/auto_cfgo.sh
+    source "${afot_path}/auto_cfgo.sh"
     ;;
   *)
-    echo "[ERROR] Optimization mode ${opt_mode} is not supported, check the configuration item: opt_mode"
-    exit 1
+    fail_stage "load_script" 1 "Optimization mode '${opt_mode}' is not supported." "Check the 'opt_mode' configuration item."
     ;;
   esac
 }
 
 # 公共依赖检查项
 function check_common_dependency() {
+  local get_arch
   get_arch=$(arch)
-  if [[ ${get_arch} =~ "x86_64" || ${get_arch} =~ "aarch64" ]]; then
-    echo "[INFO] Current arch: ${get_arch}"
+  if [[ "${get_arch}" =~ "x86_64" || "${get_arch}" =~ "aarch64" ]]; then
+    log_info "Current arch: ${get_arch}"
   else
-    echo "[ERROR] Unsupport arch: ${get_arch}"
-    exit 1
+    fail_stage "check_dependency" 1 "Unsupported arch: ${get_arch}" "Use x86_64 or aarch64."
   fi
-  if ! type perf &>/dev/null; then
-    echo "[ERROR] Optimization mode ${opt_mode} but perf is missing, try 'yum install perf'."
-    exit 1
+  if ! command -v perf >/dev/null 2>&1; then
+    fail_stage "check_dependency" 1 "Optimization mode ${opt_mode} requires perf, but it is missing." "Try 'yum install perf'."
   fi
-  is_file_exist ${build_script}
-  is_file_exist ${run_script}
-  case ${compiler} in 
-  "gcc") 
-    is_file_exist "${compiler_path}/bin/gcc"
+  is_file_exist "${build_script}" "build_script" "file"
+  is_file_exist "${run_script}" "run_script" "file"
+  case "${compiler}" in
+  "gcc")
+    is_file_exist "${compiler_path}/bin/gcc" "compiler_path" "executable"
     ;;
-  "llvm") 
-    is_file_exist "${compiler_path}/bin/clang" 
+  "llvm")
+    is_file_exist "${compiler_path}/bin/clang" "compiler_path" "executable"
     ;;
   *)
-    echo "[ERROR] compiler ${compiler} is not supported, check the configuration item: compiler"
-    exit 1
+    fail_stage "check_dependency" 1 "compiler '${compiler}' is not supported." "Check the 'compiler' configuration item."
     ;;
   esac
 }
 
 # 拆分编译数据库
 function split_option() {
-  if [ "$bear_prefix" ]; then
-    python3 $afot_path/split_json.py -i $PWD/compile_commands.json
-    mv $PWD/compile_commands.json $PWD/compile_commands_$1.json
-    mv $PWD/compile_commands.fail.json $PWD/compile_commands.fail_$1.json
+  if [[ -n "$bear_prefix" ]]; then
+    python3 "$afot_path/split_json.py" -i "$PWD/compile_commands.json"
+    mv "$PWD/compile_commands.json" "$PWD/compile_commands_$1.json"
+    mv "$PWD/compile_commands.fail.json" "$PWD/compile_commands.fail_$1.json"
   fi
 }
 
 # 使用原始编译选项进行编译
 function first_compilation() {
-  echo "[INFO] Start raw compilation."
-  is_file_exist ${build_script} "build_script"
-  if [[ $build_mode =~ "Bear" ]]; then
+  local stage_log
+  local -a cmd
+  stage_log=$(get_active_log_file)
+  log_status "开始原始构建 | 输入脚本=${build_script} | 日志=${stage_log}"
+  is_file_exist "${build_script}" "build_script" "file"
+
+  # 原始构建阶段刻意使用 build_script 自带的编译器（通常为系统 PATH 中的版本），
+  # 不注入 wrapper、不设置 CC/CXX，以此作为性能对比的基线。
+  # 后续 PGO/CSPGO/BOLT 优化阶段会通过 wrapper 切换到 ${compiler_path} 指定的编译器。
+  if [[ "${build_mode}" =~ "Bear" ]]; then
     bear_prefix="bear -- "
-    echo "[INFO] Build in Bear mode."
+    log_info "当前使用 Bear 构建模式。"
+    cmd=(bear -- bash -x "${build_script}")
   else
-    echo "[INFO] Build in Wrapper mode."
+    bear_prefix=""
+    log_info "当前使用 Wrapper 构建模式。"
+    cmd=(bash -x "${build_script}")
   fi
-  $bear_prefix bash -x ${build_script} >>${log_file} 2>&1
+  run_logged_command "原始构建" "${stage_log}" "${cmd[@]}"
+  local build_result=$?
   split_option first
-  is_file_exist ${bin_file}
-  is_success $?
+  is_success "${build_result}" "原始构建失败。" "请查看阶段日志：${stage_log}"
+  is_file_exist "${bin_file}" "bin_file" "file"
+  record_substage_artifact "构建产物：${bin_file}"
 }
 
 # 创建wrapper之后的操作
 function post_create_wrapper() {
-  chmod 755 ${compiler_wrapper}/${c_compiler}
-  chmod 755 ${compiler_wrapper}/${cxx_compiler}
+  chmod 755 "${compiler_wrapper}/${c_compiler}"
+  chmod 755 "${compiler_wrapper}/${cxx_compiler}"
 
-  export CC=${compiler_wrapper}/${c_compiler}
-  export CXX=${compiler_wrapper}/${cxx_compiler}
-  if [ "$compiler" = "gcc" ]; then
-    export LD_LIBRARY_PATH=${compiler_path}/lib64:${LD_LIBRARY_PATH}
-  else
-    export LD_LIBRARY_PATH=${compiler_path}/lib:${LD_LIBRARY_PATH}
-  fi
-
-  export PATH=${compiler_wrapper}:${PATH}
+  export CC="${compiler_wrapper}/${c_compiler}"
+  export CXX="${compiler_wrapper}/${cxx_compiler}"
+  # LD_LIBRARY_PATH 已在 init_profile_and_log() 中设置，此处不再重复叠加
+  export PATH="${compiler_wrapper}:${PATH}"
 }
 
 # 执行应用程序执行脚本
 function execute_run_script() {
-  echo "[INFO] Start to execute the run_script: ${run_script}"
-  process_id=$(pidof ${application_name})
-  if [[ -n ${process_id} ]]; then
-    echo "[ERROR] Application: ${application_name} process already exists. The run_script will not be executed. Please check!"
-    exit 1
+  local stage_log
+  local process_id
+  stage_log=$(get_active_log_file)
+  log_status "开始运行阶段 | 脚本=${run_script} | 目标进程=${application_name} | 日志=${stage_log}"
+  process_id=$(pidof "${application_name}" 2>/dev/null || true)
+  if [[ -n "${process_id}" ]]; then
+    fail_stage "optimization_flow" 1 "目标进程 '${application_name}' 已存在（PID: ${process_id}）。" "请先停止已有进程，再重新执行 A-FOT。"
   fi
-  is_file_exist ${run_script} "run_script"
-  /bin/bash -x ${run_script} >>${log_file} 2>&1 &
+  is_file_exist "${run_script}" "run_script" "file"
+  log_info "运行脚本启动时间：$(date '+%Y-%m-%d %H:%M:%S')"
+  /bin/bash -x "${run_script}" >>"${stage_log}" 2>&1 &
   run_script_pid=$!
-  is_success $?
+  log_info "运行脚本后台PID：${run_script_pid}"
+  if [[ -z "${run_script_pid}" ]]; then
+    fail_stage "optimization_flow" 1 "启动运行脚本失败，未获取到 PID。" "请检查脚本路径、权限和脚本内容。"
+  fi
 }
 
 # 探测应用进程是否存在
 function detect_process() {
-  echo "[INFO] Start to detect whether process ${application_name} is started."
   local detect_time=0
+  local wait_log_interval=10
   local pids=()
+  local remaining_pids=()
+  local pid
 
-  # 进程启动检测
+  log_status "开始探测目标进程 | name=${application_name} | 超时=${max_waiting_time}s"
+
   while true; do
-    # 使用pgrep获取所有同名进程ID
     pids=($(pgrep -x "${application_name}" || true))
-    
-    if [ ${#pids[@]} -gt 0 ]; then
-      echo "[INFO] process ${application_name} found: ${pids[*]}"
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+      log_status "目标进程已启动 | name=${application_name} | PID=${pids[*]} | 启动耗时=$(format_duration "$detect_time")"
       break
     fi
-    
+
     sleep 1
     ((detect_time++))
-    
-    if [ ${detect_time} -gt ${max_waiting_time} ]; then
-      echo "[ERROR] can not find process ${application_name} in ${max_waiting_time}s"
-      exit 1
+    if [[ ${detect_time} -eq 1 || $((detect_time % wait_log_interval)) -eq 0 ]]; then
+      log_status "等待 ${application_name} 启动 | $(format_duration "$detect_time")/$(format_duration "${max_waiting_time}")"
+    fi
+
+    if [[ ${detect_time} -gt ${max_waiting_time} ]]; then
+      fail_stage "optimization_flow" 1 "在 ${max_waiting_time}s 内未找到目标进程 ${application_name}。" "请检查 run_script 是否启动了正确的目标进程名。"
     fi
   done
 
-  # 只有AutoCFGO模式需要等待所有程序执行完毕
-  if [[ ${opt_mode} != "AutoCFGO" ]]; then
+  if [[ "${opt_mode}" != "AutoCFGO" ]]; then
     return
   fi
 
-  # 等待所有进程终止
-  echo "[INFO] waiting all ${application_name} finish"
+  log_status "开始等待 workload 结束 | 目标进程=${application_name}"
   detect_time=0
-  
-  while [ ${#pids[@]} -gt 0 ]; do
-    # 检查每个进程是否仍然存在
-    local remaining_pids=()
+
+  while [[ ${#pids[@]} -gt 0 ]]; do
+    remaining_pids=()
     for pid in "${pids[@]}"; do
-      if ps -p "${pid}" > /dev/null; then
+      if ps -p "${pid}" >/dev/null; then
         remaining_pids+=("${pid}")
       fi
     done
-    
+
     pids=("${remaining_pids[@]}")
-    
-    if [ ${#pids[@]} -eq 0 ]; then
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
       break
     fi
-    
+
     sleep 1
     ((detect_time++))
-    
-    # 每分钟打印一次状态
-    if [ $((detect_time % 60)) -eq 0 ]; then
-      echo "[INFO] There are still ${#pids[@]} ${application_name} processes running: ${pids[*]}"
+
+    if [[ $((detect_time % 60)) -eq 0 ]]; then
+      log_status "等待 ${application_name} 退出 | $(format_duration "$detect_time")/$(format_duration "${max_waiting_time}") | 在运行PID=${pids[*]}"
     fi
-    
-    if [ ${detect_time} -gt ${max_waiting_time} ]; then
-      echo "[ERROR] Process ${application_name} did not fully terminate within ${max_waiting_time} seconds"
-      exit 1
+
+    if [[ ${detect_time} -gt ${max_waiting_time} ]]; then
+      fail_stage "optimization_flow" 1 "进程 ${application_name} 未在 ${max_waiting_time}s 内全部退出。" "请检查 workload 是否正常结束。"
     fi
   done
-  
-  echo "[INFO] All ${application_name} process has finish"
+
+  log_status "workload 已结束 | 目标进程=${application_name} | 等待耗时=$(format_duration "$detect_time")"
 }
 
 # 使用新的编译选项编译，同时判断优化结果.
 # 需注意此检查依赖wrapper中编译器后添加第一个编译选项，
 # 因此需保证编译器后添加第一个编译选项为优化选项而非通用选项
 function second_compilation() {
-  echo "[INFO] Try compiling with the new compilation options."
-  if [[ ${check_success} -eq 1 ]]; then
-    $bear_prefix /bin/bash -x ${build_script} >>${log_file} 2>&1 & build_id=$!
-    echo "[INFO] Found build id: ${build_id}"
-    add_opt=$(cat ${compiler_wrapper}/${c_compiler} | awk -F " " '{print $2}')
-    build_status=$(ps -p ${build_id} | grep -c ${build_id})
-    opt_success=0
-    while [[ ${build_status} -ne 0 ]]; do
-      if [[ ${opt_success} -eq 0 ]]; then
-        # 使用:1去除编译选项左边的'-'
-        if [[ $(ps aux | grep -c "${add_opt:1}") -gt 1 ]]; then
-          opt_success=1
-          break
-        fi
-      fi
-      build_status=$(ps -p ${build_id} | grep -c ${build_id})
-    done
-    wait
+  local stage_log
+  local -a cmd
+  stage_log=$(get_active_log_file)
+  log_status "开始优化构建 | 输入脚本=${build_script} | 日志=${stage_log}"
+  if [[ "${build_mode}" =~ "Bear" ]]; then
+    bear_prefix="bear -- "
+    cmd=(bear -- /bin/bash -x "${build_script}")
   else
-    $bear_prefix /bin/bash -x ${build_script} >>${log_file} 2>&1
+    bear_prefix=""
+    cmd=(/bin/bash -x "${build_script}")
   fi
-  echo "[INFO] Finish compiling with new compilation options."
-  is_file_exist ${bin_file}
+  run_logged_command "优化构建" "${stage_log}" "${cmd[@]}"
+  local build_result=$?
+  log_info "新的编译选项构建结束。"
+  is_success "${build_result}" "使用优化选项构建失败。" "请查看阶段日志：${stage_log}"
+  is_file_exist "${bin_file}" "bin_file" "file"
   split_option second
-  is_success $?
+  record_substage_artifact "构建产物：${bin_file}"
 }
 
-# 判断上一步执行是否成功
 function is_success() {
-  pre_result=$1
-  if [[ ${pre_result} -ne 0 ]]; then
-    echo "[ERROR] Execution failed, please check the log: ${log_file}"
-    exit 1
+  local pre_result="$1"
+  local message="${2:-Execution failed.}"
+  local hint="${3:-Please check the log for details.}"
+  if [[ "${pre_result}" -ne 0 ]]; then
+    fail_stage "${current_stage}" "${pre_result}" "${message}" "${hint}"
   fi
 }
 
-# 检查配置文件脚本是否存在
 function is_file_exist() {
-  file=$1
-  config_item=$2
-  if [[ ! -f ${file} ]]; then
-    if [[ -n ${config_item} ]]; then
-      echo "[ERROR] The file ${file} does not exist! Check the configuration item: ${config_item}"
-    else
-      echo "[ERROR] The file ${file} does not exist!"
+  local path="$1"
+  local config_item="$2"
+  local expected_type="${3:-file}"
+
+  case "${expected_type}" in
+  file)
+    if [[ ! -e "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Required file '${path}' does not exist (config: ${config_item})." "Check the '${config_item}' configuration item."
     fi
-    exit 1
-  fi
+    if [[ ! -f "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Path '${path}' is not a regular file (config: ${config_item})." "Check the '${config_item}' configuration item."
+    fi
+    ;;
+  directory)
+    if [[ ! -e "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Required directory '${path}' does not exist (config: ${config_item})." "Check the '${config_item}' configuration item."
+    fi
+    if [[ ! -d "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Path '${path}' is not a directory (config: ${config_item})." "Check the '${config_item}' configuration item."
+    fi
+    ;;
+  executable)
+    if [[ ! -e "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Required executable '${path}' does not exist (config: ${config_item})." "Check the '${config_item}' configuration item."
+    fi
+    if [[ ! -f "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Path '${path}' is not a regular file (config: ${config_item})." "Check the '${config_item}' configuration item."
+    fi
+    if [[ ! -x "${path}" ]]; then
+      fail_stage "${current_stage}" 1 "Path '${path}' is not executable (config: ${config_item})." "Check file permissions or the '${config_item}' configuration item."
+    fi
+    ;;
+  *)
+    fail_stage "${current_stage}" 1 "Unsupported file check type '${expected_type}'." "Use file, directory, or executable."
+    ;;
+  esac
 }
 
 #初始化profile文件夹和log文件
 function init_profile_and_log() {
-  # profile和log所在路径
-  now_time=$(date '+%Y%m%d-%H%M%S')
-  profile_data_path=${work_path}/${now_time}
-  log_file=${work_path}/${now_time}/opt.log
-  if [[ ! -d ${profile_data_path} ]]; then
-    mkdir -p ${profile_data_path}
+  if [[ -n "${last_time:-}" ]]; then
+    now_time="${last_time}"
+  else
+    now_time=$(date '+%Y%m%d-%H%M%S')
   fi
-  echo "[INFO] Create profile dir: ${profile_data_path}"
+  profile_data_path="${work_path}/${now_time}"
+  log_file="${profile_data_path}/opt.log"
+  summary_file="${profile_data_path}/run-summary.txt"
+  logs_dir="${profile_data_path}/logs"
+  artifacts_dir="${profile_data_path}/artifacts"
+  wrappers_dir="${profile_data_path}/wrappers"
+  profiles_dir="${profile_data_path}/profiles"
+  compile_trace_file="${artifacts_dir}/compile.trace"
 
-  touch ${log_file}
-  echo "[INFO] Init log file: ${log_file}"
+  if [[ ! -d "${profile_data_path}" ]]; then
+    mkdir -p "${profile_data_path}" || fail_stage "init_runtime" 1 "Failed to create profile directory '${profile_data_path}'." "Check that work_path='${work_path}' exists and is writable."
+  fi
 
-  # 设置c和c++编译器
-  if [ "$compiler" = "gcc" ]; then
+  mkdir -p "${logs_dir}" "${artifacts_dir}" "${wrappers_dir}" "${profiles_dir}" || fail_stage "init_runtime" 1 "无法初始化日志、产物、wrapper 或 profile 目录。" "请检查工作目录权限。"
+  touch "${log_file}" || fail_stage "init_runtime" 1 "Failed to initialize log file '${log_file}'." "Check directory permissions for '${profile_data_path}'."
+  touch "${summary_file}" || fail_stage "init_runtime" 1 "Failed to initialize summary file '${summary_file}'." "Check directory permissions for '${profile_data_path}'."
+  : >"${compile_trace_file}" || fail_stage "init_runtime" 1 "无法初始化编译 trace 文件 '${compile_trace_file}'。" "请检查目录权限。"
+
+  log_status "创建运行目录：${profile_data_path}"
+  log_info "初始化主日志：${log_file}"
+
+  if [[ "$compiler" == "gcc" ]]; then
     c_compiler="gcc"
     cxx_compiler="g++"
-    export LD_LIBRARY_PATH=${compiler_path}/lib64:${LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH="${compiler_path}/lib64:${LD_LIBRARY_PATH}"
   else
     c_compiler="clang"
     cxx_compiler="clang++"
-    export LD_LIBRARY_PATH=${compiler_path}/lib:${LD_LIBRARY_PATH}
-  fi  
+    export LD_LIBRARY_PATH="${compiler_path}/lib:${LD_LIBRARY_PATH}"
+  fi
 
-  # 创建Wrapper所在路径
-  compiler_wrapper="${work_path}/${now_time}/compiler_wrapper/"
-  mkdir -p ${compiler_wrapper}
+  compiler_wrapper="${wrappers_dir}/current"
+  mkdir -p "${compiler_wrapper}" || fail_stage "init_runtime" 1 "Failed to create compiler wrapper directory '${compiler_wrapper}'." "Check directory permissions for '${profile_data_path}'."
+  log_runtime_paths
+  write_summary
 }
 
 #检测是否优化成功
 function is_opt_success() {
-  if [[ ${check_success} -eq 1 ]]; then
-    if [[ ${opt_success} -eq 0 ]]; then
-      echo "[WARNING] Optimization may fail or the build process is too short, please check!"
-      echo "[WARNING] Please try gcc/g++ or clang/clang++ at: ${compiler_wrapper} instead of the original compiler."
-      exit 1
-    else
-      echo "[INFO] Optimization success!"
-    fi
-  fi
-  exit 0
+  log_status "优化流程执行完成。"
+  finish_success
+}
+
+function cfgo_stage_build_raw() {
+  first_compilation
+}
+
+function cfgo_stage_run_raw() {
+  execute_run_script
+  detect_process
+  profiling
+}
+
+function cfgo_stage_build_pgo() {
+  prepare_env
+  second_compilation
+  analyze_compile_trace "03-build-cfgo-pgo" "-fcfgo-profile-generate="
+  backup_cfgo_binary "cfgo-pgo"
+  backup_cfgo_cleanup_dirs "cfgo-pgo"
+}
+
+function cfgo_stage_run_pgo() {
+  execute_run_script
+  detect_process
+  profiling
+}
+
+function cfgo_stage_build_cspgo() {
+  prepare_new_env
+  second_compilation
+  analyze_compile_trace "05-build-cfgo-cspgo" "-fcfgo-profile-use=" "-fcfgo-csprofile-generate="
+  backup_cfgo_binary "cfgo-cspgo"
+  backup_cfgo_cleanup_dirs "cfgo-cspgo"
+}
+
+function cfgo_stage_run_cspgo() {
+  execute_run_script
+  detect_process
+  profiling
+}
+
+function cfgo_stage_bolt_instrument() {
+  prepare_bolt_env
+  second_compilation
+  analyze_compile_trace "07-bolt-instrument" "-fcfgo-profile-use=" "-fcfgo-csprofile-use=" "-Wl,-q"
+  do_bolt_instrument
+}
+
+function cfgo_stage_run_bolt() {
+  execute_run_script
+  detect_process
+  profiling
+}
+
+function cfgo_stage_bolt_optimize() {
+  do_bolt_opt
 }
 
 function do_optimization() {
-  if [[ ${opt_mode} == Auto_kernel_PGO ]]; then
-    source ${afot_path}/auto_kernel_pgo.sh
+  if [[ "${opt_mode}" == "Auto_kernel_PGO" ]]; then
+    source "${afot_path}/auto_kernel_pgo.sh"
   fi
+
+  mark_stage_started "validate_config"
   check_config_items
+  mark_stage_success "validate_config"
+
+  if [[ "${opt_mode}" == "AutoCFGO" ]]; then
+    cfgo_effective_start_substage="${start_substage:-01-build-raw}"
+  fi
+
+  mark_stage_started "init_runtime"
   init_profile_and_log
+  mark_stage_success "init_runtime"
+
+  print_effective_config_summary
+
+  mark_stage_started "load_script"
   load_script
+  mark_stage_success "load_script"
 
+  mark_stage_started "check_dependency"
   check_dependency
+  mark_stage_success "check_dependency"
 
-  # CFGO流程
-  if [[ ${opt_mode} =~ "AutoCFGO" ]]; then
-    # 执行CFGO-PGO插桩
-    prepare_env
-    first_compilation
-    execute_run_script
-    detect_process
-    profiling
+  mark_stage_started "optimization_flow"
 
-    # 执行CFGO-CSPGO插桩
-    prepare_new_env
-    second_compilation
-    execute_run_script
-    detect_process
-    profiling
-
-    # 执行CFGO-BOLT
-    prepare_bolt_env
-    second_compilation
-    do_bolt_instrument
-    execute_run_script
-    detect_process
-    profiling
-    do_bolt_opt
+  if [[ "${opt_mode}" =~ "AutoCFGO" ]]; then
+    run_cfgo_flow
   else
-    # 其他模式原有流程
     prepare_env
     first_compilation
     execute_run_script
@@ -527,15 +1638,33 @@ function do_optimization() {
     prepare_new_env
     second_compilation
   fi
-  
+
+  mark_stage_success "optimization_flow"
   is_opt_success
 }
 
+# Ctrl-C 或 kill 时清理后台进程并写入最终 summary
+function cleanup_on_interrupt() {
+  log_warn "收到中断信号，正在清理..."
+  write_summary
+  if [[ -n "${run_script_pid:-}" ]] && kill -0 "${run_script_pid}" 2>/dev/null; then
+    kill "${run_script_pid}" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap cleanup_on_interrupt INT TERM
+
 #执行入口，部分函数为加载不同优化脚本中得到
 function main() {
-  parse_input_params "$@"
+  init_runtime_context
+
+  parse_config_file_arg "$@"
+
+  mark_stage_started "parse_config"
   parse_config
   parse_input_params "$@"
+  mark_stage_success "parse_config"
+
   do_optimization
   exit "$?"
 }
